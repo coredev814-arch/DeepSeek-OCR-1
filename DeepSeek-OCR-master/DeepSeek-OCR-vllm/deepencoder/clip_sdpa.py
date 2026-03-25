@@ -1,5 +1,6 @@
-from contextlib import nullcontext
+import logging
 import math
+from contextlib import nullcontext
 from typing import Optional, Tuple
 # from megatron.model import LayerNorm
 from easydict import EasyDict as adict
@@ -7,6 +8,8 @@ import torch
 from torch.nn import functional as F
 from torch import nn
 from flash_attn import flash_attn_qkvpacked_func, flash_attn_func
+
+logger = logging.getLogger(__name__)
 # from optimus import flash_attn_func
 # from megatron.core import tensor_parallel
 # from megatron.core import parallel_state as mpu

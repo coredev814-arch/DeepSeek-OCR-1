@@ -575,8 +575,4 @@ class DeepseekOCRForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         loader = AutoWeightsLoader(self)
         autoloaded_weights = loader.load_weights(processed_weights, mapper=self.hf_to_vllm_mapper)
 
-
-
-
-
         return autoloaded_weights

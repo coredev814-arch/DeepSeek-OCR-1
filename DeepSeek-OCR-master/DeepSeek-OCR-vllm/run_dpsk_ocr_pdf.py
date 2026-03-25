@@ -1,11 +1,14 @@
+import ast
+import io
+import logging
 import os
+import re
+
 import fitz
 import img2pdf
-import io
-import re
-from tqdm import tqdm
 import torch
 from concurrent.futures import ThreadPoolExecutor
+from tqdm import tqdm
  
 
 if torch.version.cuda == '11.8':
@@ -16,9 +19,15 @@ os.environ["CUDA_VISIBLE_DEVICES"] = '0'
 
 from config import MODEL_PATH, INPUT_PATH, OUTPUT_PATH, PROMPT, SKIP_REPEAT, MAX_CONCURRENCY, NUM_WORKERS, CROP_MODE
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 import numpy as np
 from deepseek_ocr import DeepseekOCRForCausalLM
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+logger = logging.getLogger(__name__)
 
 from vllm.model_executor.models.registry import ModelRegistry
 
@@ -140,9 +149,9 @@ def extract_coordinates_and_label(ref_text, image_width, image_height):
 
     try:
         label_type = ref_text[1]
-        cor_list = eval(ref_text[2])
-    except Exception as e:
-        print(e)
+        cor_list = ast.literal_eval(ref_text[2])
+    except (ValueError, SyntaxError) as e:
+        logger.warning("Failed to parse coordinates: %s", e)
         return None
 
     return (label_type, cor_list)
@@ -151,23 +160,22 @@ def extract_coordinates_and_label(ref_text, image_width, image_height):
 def draw_bounding_boxes(image, refs, jdx):
 
     image_width, image_height = image.size
-    img_draw = image.copy()
+    img_draw = image.copy().convert("RGBA")
     draw = ImageDraw.Draw(img_draw)
 
     overlay = Image.new('RGBA', img_draw.size, (0, 0, 0, 0))
     draw2 = ImageDraw.Draw(overlay)
-    
-    #     except IOError:
+
     font = ImageFont.load_default()
 
     img_idx = 0
-    
+
     for i, ref in enumerate(refs):
         try:
             result = extract_coordinates_and_label(ref, image_width, image_height)
             if result:
                 label_type, points_list = result
-                
+
                 color = (np.random.randint(0, 200), np.random.randint(0, 200), np.random.randint(0, 255))
 
                 color_a = color + (20, )
@@ -185,34 +193,28 @@ def draw_bounding_boxes(image, refs, jdx):
                             cropped = image.crop((x1, y1, x2, y2))
                             cropped.save(f"{OUTPUT_PATH}/images/{jdx}_{img_idx}.jpg")
                         except Exception as e:
-                            print(e)
-                            pass
+                            logger.error("Failed to crop/save image region %d: %s", img_idx, e)
                         img_idx += 1
-                        
-                    try:
-                        if label_type == 'title':
-                            draw.rectangle([x1, y1, x2, y2], outline=color, width=4)
-                            draw2.rectangle([x1, y1, x2, y2], fill=color_a, outline=(0, 0, 0, 0), width=1)
-                        else:
-                            draw.rectangle([x1, y1, x2, y2], outline=color, width=2)
-                            draw2.rectangle([x1, y1, x2, y2], fill=color_a, outline=(0, 0, 0, 0), width=1)
 
-                        text_x = x1
-                        text_y = max(0, y1 - 15)
-                            
-                        text_bbox = draw.textbbox((0, 0), label_type, font=font)
-                        text_width = text_bbox[2] - text_bbox[0]
-                        text_height = text_bbox[3] - text_bbox[1]
-                        draw.rectangle([text_x, text_y, text_x + text_width, text_y + text_height], 
-                                    fill=(255, 255, 255, 30))
-                        
-                        draw.text((text_x, text_y), label_type, font=font, fill=color)
-                    except:
-                        pass
-        except:
+                    width = 4 if label_type == 'title' else 2
+                    draw.rectangle([x1, y1, x2, y2], outline=color, width=width)
+                    draw2.rectangle([x1, y1, x2, y2], fill=color_a, outline=(0, 0, 0, 0), width=1)
+
+                    text_x = x1
+                    text_y = max(0, y1 - 15)
+
+                    text_bbox = draw.textbbox((0, 0), label_type, font=font)
+                    text_width = text_bbox[2] - text_bbox[0]
+                    text_height = text_bbox[3] - text_bbox[1]
+                    draw.rectangle([text_x, text_y, text_x + text_width, text_y + text_height],
+                                fill=(255, 255, 255, 180))
+
+                    draw.text((text_x, text_y), label_type, font=font, fill=color)
+        except Exception as e:
+            logger.error("Error processing ref %d: %s", i, e)
             continue
-    img_draw.paste(overlay, (0, 0), overlay)
-    return img_draw
+    img_draw = Image.alpha_composite(img_draw, overlay)
+    return img_draw.convert("RGB")
 
 
 def process_image_with_refs(image, ref_texts, jdx):
@@ -222,9 +224,8 @@ def process_image_with_refs(image, ref_texts, jdx):
 
 def process_single_image(image):
     """single image"""
-    prompt_in = prompt
     cache_item = {
-        "prompt": prompt_in,
+        "prompt": PROMPT,
         "multi_modal_data": {"image": DeepseekOCRProcessor().tokenize_with_images(images = [image], bos=True, eos=True, cropping=CROP_MODE)},
     }
     return cache_item
@@ -239,9 +240,6 @@ if __name__ == "__main__":
 
 
     images = pdf_to_images_high_quality(INPUT_PATH)
-
-
-    prompt = PROMPT
 
     # batch_inputs = []
 
@@ -277,7 +275,7 @@ if __name__ == "__main__":
 
 
     mmd_det_path = output_path + '/' + INPUT_PATH.split('/')[-1].replace('.pdf', '_det.mmd')
-    mmd_path = output_path + '/' + INPUT_PATH.split('/')[-1].replace('pdf', 'mmd')
+    mmd_path = output_path + '/' + INPUT_PATH.split('/')[-1].replace('.pdf', '.mmd')
     pdf_out_path = output_path + '/' + INPUT_PATH.split('/')[-1].replace('.pdf', '_layouts.pdf')
     contents_det = ''
     contents = ''
@@ -288,9 +286,10 @@ if __name__ == "__main__":
 
         if '<｜end▁of▁sentence｜>' in content: # repeat no eos
             content = content.replace('<｜end▁of▁sentence｜>', '')
-        else:
-            if SKIP_REPEAT:
-                continue
+        elif SKIP_REPEAT:
+            logger.warning("Page %d: no EOS token found (possible repetition), skipping content but keeping page", jdx)
+            jdx += 1
+            continue
 
         
         page_num = f'\n<--- Page Split --->'

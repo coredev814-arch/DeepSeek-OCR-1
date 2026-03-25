@@ -1,3 +1,5 @@
+import os
+
 # TODO: change modes
 # Tiny: base_size = 512, image_size = 512, crop_mode = False
 # Small: base_size = 640, image_size = 640, crop_mode = False
@@ -14,7 +16,7 @@ MAX_CONCURRENCY = 100 # If you have limited GPU memory, lower the concurrency co
 NUM_WORKERS = 64 # image pre-process (resize/padding) workers 
 PRINT_NUM_VIS_TOKENS = False
 SKIP_REPEAT = False
-MODEL_PATH = 'deepseek-ai/DeepSeek-OCR' # change to your model path
+MODEL_PATH = os.environ.get("MODEL_PATH", '/workspace/models/DeepSeek-OCR') # change to your model path
 
 # TODO: change INPUT_PATH
 # .pdf: run_dpsk_ocr_pdf.py; 
@@ -37,6 +39,16 @@ PROMPT = '<image>\n<|grounding|>Convert the document to markdown.'
 # .......
 
 
+import threading
 from transformers import AutoTokenizer
 
-TOKENIZER = AutoTokenizer.from_pretrained(MODEL_PATH, trust_remote_code=True)
+_tokenizer = None
+_tokenizer_lock = threading.Lock()
+
+def get_tokenizer():
+    global _tokenizer
+    if _tokenizer is None:
+        with _tokenizer_lock:
+            if _tokenizer is None:
+                _tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, trust_remote_code=True)
+    return _tokenizer
