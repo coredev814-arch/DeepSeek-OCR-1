@@ -117,6 +117,46 @@ def _validate_prompt(prompt: str) -> str:
     return prompt
 
 
+def _collapse_empty_table_cells(text: str) -> str:
+    """Collapse runs of excessive empty <td></td> cells in table rows.
+
+    The model sometimes hallucinates hundreds of empty cells for rows that
+    should only contain a handful of columns.  We cap at a reasonable limit
+    and trim the rest.
+    """
+    MAX_EMPTY_CELLS_PER_ROW = 20  # generous upper bound
+
+    def _trim_row(match: re.Match) -> str:
+        row_html = match.group(0)
+        # Count empty cells
+        empty_cells = re.findall(r"<td></td>", row_html)
+        if len(empty_cells) <= MAX_EMPTY_CELLS_PER_ROW:
+            return row_html
+        # Keep non-empty cells and up to MAX_EMPTY_CELLS_PER_ROW empty ones
+        # Replace runs of empty cells exceeding the limit
+        parts = re.split(r"(<td></td>)", row_html)
+        result = []
+        empty_count = 0
+        for part in parts:
+            if part == "<td></td>":
+                empty_count += 1
+                if empty_count <= MAX_EMPTY_CELLS_PER_ROW:
+                    result.append(part)
+            else:
+                result.append(part)
+        return "".join(result)
+
+    # Process each table row
+    text = re.sub(r"<tr>.*?</tr>", _trim_row, text, flags=re.DOTALL)
+
+    # Also handle cases where empty cells spill outside proper row tags
+    # (model generates <td></td> flood without </tr>)
+    text = re.sub(r"(<td></td>){" + str(MAX_EMPTY_CELLS_PER_ROW) + r",}",
+                  "<td></td>" * MAX_EMPTY_CELLS_PER_ROW, text)
+
+    return text
+
+
 def clean_output(text: str) -> str:
     """Remove grounding annotations and clean up the OCR output."""
     text = text.replace("<｜end▁of▁sentence｜>", "")
@@ -129,6 +169,7 @@ def clean_output(text: str) -> str:
             text = text.replace(match[0], "")
 
     text = text.replace("\\coloneqq", ":=").replace("\\eqqcolon", "=:")
+    text = _collapse_empty_table_cells(text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
@@ -257,6 +298,7 @@ async def lifespan(app: FastAPI):
 
     llm = LLM(
         model=MODEL_PATH,
+        task="generate",
         hf_overrides={"architectures": ["DeepseekOCRForCausalLM"]},
         block_size=256,
         enforce_eager=False,
@@ -274,6 +316,7 @@ async def lifespan(app: FastAPI):
             ngram_size=20,
             window_size=50,
             whitelist_token_ids={128821, 128822},
+            max_consecutive_empty_cells=30,  # ban <td></td> after 15 consecutive empty pairs
         )
     ]
     sampling_params = SamplingParams(

@@ -10,7 +10,10 @@ import torch.nn.functional as F
 
 from typing import Optional, Tuple, Type
 from functools import partial
-from flash_attn import flash_attn_qkvpacked_func
+try:
+    from flash_attn import flash_attn_qkvpacked_func
+except ImportError:
+    flash_attn_qkvpacked_func = None
 # from .common import LayerNorm2d, MLPBlock
 
 # from mmgpt.model.vision_encoder.flash_4 import _attention_rel_h_rel_w

@@ -7,7 +7,11 @@ from easydict import EasyDict as adict
 import torch
 from torch.nn import functional as F
 from torch import nn
-from flash_attn import flash_attn_qkvpacked_func, flash_attn_func
+try:
+    from flash_attn import flash_attn_qkvpacked_func, flash_attn_func
+except ImportError:
+    flash_attn_qkvpacked_func = None
+    flash_attn_func = None
 
 logger = logging.getLogger(__name__)
 # from optimus import flash_attn_func
