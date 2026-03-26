@@ -13,6 +13,7 @@ Changes from original:
 - Fixed uvicorn workers locked to 1 (multi-process would duplicate the model)
 - Consistent response schema for raw/non-raw modes
 - Structured logging replaces print statements
+- Modular scoring/retry system for quality assurance
 """
 
 import asyncio
@@ -20,7 +21,6 @@ import base64
 import io
 import logging
 import os
-import re
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -39,14 +39,24 @@ VLLM_SRC = os.path.join(
 sys.path.insert(0, VLLM_SRC)
 
 import fitz  # PyMuPDF
-import numpy as np
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
 from PIL import Image, ImageOps
-from pydantic import BaseModel
 
 from config import CROP_MODE, MAX_CONCURRENCY, NUM_WORKERS
 from deepseek_ocr import DeepseekOCRForCausalLM
+from process import (
+    clean_output,
+    enhance_scan,
+    enhance_scan_with_preset,
+    ENHANCEMENT_PRESETS,
+    OCRResult,
+    score_result,
+    select_best_result,
+    needs_retry,
+    DEFAULT_THRESHOLD,
+    DEFAULT_MAX_RETRIES,
+)
 from process.image_process import DeepseekOCRProcessor
 from process.ngram_norepeat import NoRepeatNGramLogitsProcessor
 from vllm import LLM, SamplingParams
@@ -78,6 +88,10 @@ MAX_PDF_PAGES = int(os.environ.get("MAX_PDF_PAGES", "50"))
 MAX_BATCH_SIZE = int(os.environ.get("MAX_BATCH_SIZE", "16"))
 REQUEST_TIMEOUT_S = int(os.environ.get("REQUEST_TIMEOUT_S", "120"))
 
+# Scoring / retry
+SCORE_THRESHOLD = float(os.environ.get("SCORE_THRESHOLD", str(DEFAULT_THRESHOLD)))
+MAX_RETRIES = int(os.environ.get("MAX_RETRIES", str(DEFAULT_MAX_RETRIES)))
+
 # ---------------------------------------------------------------------------
 # Prompt templates
 # ---------------------------------------------------------------------------
@@ -108,7 +122,6 @@ _inference_semaphore: Optional[asyncio.Semaphore] = None
 
 
 def _validate_prompt(prompt: str) -> str:
-    """Raise 400 if prompt key is unknown, otherwise return it."""
     if prompt not in PROMPTS:
         raise HTTPException(
             400,
@@ -117,65 +130,8 @@ def _validate_prompt(prompt: str) -> str:
     return prompt
 
 
-def _collapse_empty_table_cells(text: str) -> str:
-    """Collapse runs of excessive empty <td></td> cells in table rows.
-
-    The model sometimes hallucinates hundreds of empty cells for rows that
-    should only contain a handful of columns.  We cap at a reasonable limit
-    and trim the rest.
-    """
-    MAX_EMPTY_CELLS_PER_ROW = 20  # generous upper bound
-
-    def _trim_row(match: re.Match) -> str:
-        row_html = match.group(0)
-        # Count empty cells
-        empty_cells = re.findall(r"<td></td>", row_html)
-        if len(empty_cells) <= MAX_EMPTY_CELLS_PER_ROW:
-            return row_html
-        # Keep non-empty cells and up to MAX_EMPTY_CELLS_PER_ROW empty ones
-        # Replace runs of empty cells exceeding the limit
-        parts = re.split(r"(<td></td>)", row_html)
-        result = []
-        empty_count = 0
-        for part in parts:
-            if part == "<td></td>":
-                empty_count += 1
-                if empty_count <= MAX_EMPTY_CELLS_PER_ROW:
-                    result.append(part)
-            else:
-                result.append(part)
-        return "".join(result)
-
-    # Process each table row
-    text = re.sub(r"<tr>.*?</tr>", _trim_row, text, flags=re.DOTALL)
-
-    # Also handle cases where empty cells spill outside proper row tags
-    # (model generates <td></td> flood without </tr>)
-    text = re.sub(r"(<td></td>){" + str(MAX_EMPTY_CELLS_PER_ROW) + r",}",
-                  "<td></td>" * MAX_EMPTY_CELLS_PER_ROW, text)
-
-    return text
-
-
-def clean_output(text: str) -> str:
-    """Remove grounding annotations and clean up the OCR output."""
-    text = text.replace("<｜end▁of▁sentence｜>", "")
-
-    # Remove grounding refs (non-image)
-    pattern = r"(<\|ref\|>(.*?)<\|/ref\|><\|det\|>(.*?)<\|/det\|>)"
-    matches = re.findall(pattern, text, re.DOTALL)
-    for match in matches:
-        if "<|ref|>image<|/ref|>" not in match[0]:
-            text = text.replace(match[0], "")
-
-    text = text.replace("\\coloneqq", ":=").replace("\\eqqcolon", "=:")
-    text = _collapse_empty_table_cells(text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()
-
-
 def load_image_from_bytes(data: bytes) -> Image.Image:
-    """Load a PIL Image from bytes with EXIF correction."""
+    """Load a PIL Image from bytes with EXIF correction and scan enhancement."""
     try:
         image = Image.open(io.BytesIO(data))
     except Exception as e:
@@ -184,6 +140,7 @@ def load_image_from_bytes(data: bytes) -> Image.Image:
         image = ImageOps.exif_transpose(image)
     except Exception:
         pass
+    image = enhance_scan(image)
     return image.convert("RGB")
 
 
@@ -202,7 +159,6 @@ def preprocess_image(image: Image.Image, prompt_key: str = DEFAULT_PROMPT) -> di
 async def preprocess_images_batch(
     images: list[Image.Image], prompt_key: str
 ) -> list[dict]:
-    """Preprocess a list of images using the module-level thread pool."""
     loop = asyncio.get_event_loop()
     futures = [
         loop.run_in_executor(thread_pool, preprocess_image, img, prompt_key)
@@ -228,19 +184,15 @@ def pdf_to_images(pdf_bytes: bytes, dpi: int = 144) -> list[Image.Image]:
     for page in doc:
         pix = page.get_pixmap(matrix=matrix, alpha=False)
         img_data = pix.tobytes("png")
-        img = Image.open(io.BytesIO(img_data)).convert("RGB")
+        img = Image.open(io.BytesIO(img_data))
+        img = enhance_scan(img).convert("RGB")
         images.append(img)
     doc.close()
     return images
 
 
 async def _run_inference(inputs: list[dict]) -> list:
-    """
-    Run llm.generate() with semaphore protection.
-
-    This ensures only one generate() call uses the GPU at a time,
-    preventing memory conflicts from concurrent requests.
-    """
+    """Run llm.generate() with semaphore protection."""
     loop = asyncio.get_event_loop()
 
     async with _inference_semaphore:
@@ -266,15 +218,96 @@ def _format_result(output, raw: bool) -> dict:
     """Build a consistent result dict from a single vLLM output."""
     text = output.outputs[0].text
     cleaned = clean_output(text)
+    num_tokens = len(output.outputs[0].token_ids)
+
+    # Score the result
+    ocr_result = OCRResult(
+        raw_text=text,
+        clean_text=cleaned,
+        num_tokens=num_tokens,
+        max_tokens=MAX_TOKENS,
+    )
+    score = score_result(ocr_result)
+
     return {
         "text": text if raw else cleaned,
         "raw_text": text,
-        "num_tokens": len(output.outputs[0].token_ids),
+        "num_tokens": num_tokens,
+        "score": score.to_dict(),
+    }
+
+
+async def _run_inference_with_retry(
+    image: Image.Image,
+    prompt_key: str,
+    raw_image_data: Optional[bytes] = None,
+) -> dict:
+    """Run OCR with scoring and retry on low-quality results.
+
+    Tries different enhancement presets and returns the best-scoring result.
+    """
+    results: list[OCRResult] = []
+
+    for attempt, preset in enumerate(ENHANCEMENT_PRESETS):
+        if attempt > 0 and results and not needs_retry(results[-1], SCORE_THRESHOLD):
+            break  # previous result was good enough
+        if attempt >= MAX_RETRIES:
+            break
+
+        # Apply enhancement preset
+        if preset["contrast"] is None:
+            enhanced = enhance_scan(image)
+        else:
+            enhanced = enhance_scan_with_preset(
+                image, preset["contrast"], preset["sharpness"]
+            )
+        enhanced = enhanced.convert("RGB")
+
+        loop = asyncio.get_event_loop()
+        vllm_input = await loop.run_in_executor(
+            thread_pool, preprocess_image, enhanced, prompt_key
+        )
+        outputs = await _run_inference([vllm_input])
+
+        text = outputs[0].outputs[0].text
+        cleaned = clean_output(text)
+        num_tokens = len(outputs[0].outputs[0].token_ids)
+
+        ocr_result = OCRResult(
+            raw_text=text,
+            clean_text=cleaned,
+            num_tokens=num_tokens,
+            max_tokens=MAX_TOKENS,
+            preset_name=preset["name"],
+        )
+        score_result(ocr_result, other_results=results, image_width=image.width, image_height=image.height)
+        results.append(ocr_result)
+
+        logger.info(
+            "Attempt %d/%d (preset=%s): %d tokens, score=%.3f",
+            attempt + 1,
+            MAX_RETRIES,
+            preset["name"],
+            num_tokens,
+            ocr_result.score.composite,
+        )
+
+        if not needs_retry(ocr_result, SCORE_THRESHOLD):
+            break
+
+    best = select_best_result(results)
+
+    return {
+        "text": best.clean_text,
+        "raw_text": best.raw_text,
+        "num_tokens": best.num_tokens,
+        "score": best.score.to_dict() if best.score else None,
+        "attempts": len(results),
+        "preset": best.preset_name,
     }
 
 
 def _check_file_size(data: bytes, max_mb: int, label: str = "File"):
-    """Raise 413 if data exceeds the size limit."""
     size_mb = len(data) / (1024 * 1024)
     if size_mb > max_mb:
         raise HTTPException(
@@ -316,7 +349,7 @@ async def lifespan(app: FastAPI):
             ngram_size=20,
             window_size=50,
             whitelist_token_ids={128821, 128822},
-            max_consecutive_empty_cells=30,  # ban <td></td> after 15 consecutive empty pairs
+            max_consecutive_empty_cells=30,
         )
     ]
     sampling_params = SamplingParams(
@@ -330,7 +363,6 @@ async def lifespan(app: FastAPI):
     processor = DeepseekOCRProcessor()
     thread_pool = ThreadPoolExecutor(max_workers=NUM_WORKERS)
 
-    # Allow up to MAX_CONCURRENCY inference calls to queue, but only 1 runs at a time
     _inference_semaphore = asyncio.Semaphore(1)
 
     logger.info("Model loaded and ready.")
@@ -341,7 +373,6 @@ async def lifespan(app: FastAPI):
     logger.info("Shutting down …")
     if thread_pool:
         thread_pool.shutdown(wait=False)
-    # Release GPU memory
     del llm
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -351,7 +382,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="DeepSeek-OCR API",
     description="Production OCR API powered by DeepSeek-OCR",
-    version="2.0.0",
+    version="3.0.0",
     lifespan=lifespan,
 )
 
@@ -374,6 +405,10 @@ async def health():
         "gpu": (
             torch.cuda.get_device_name(0) if torch.cuda.is_available() else "none"
         ),
+        "scoring": {
+            "threshold": SCORE_THRESHOLD,
+            "max_retries": MAX_RETRIES,
+        },
     }
 
 
@@ -382,26 +417,44 @@ async def ocr_image(
     file: UploadFile = File(...),
     prompt: str = Form(DEFAULT_PROMPT),
     raw: bool = Form(False),
+    retry: bool = Form(True),
 ):
     """
-    OCR a single image.
+    OCR a single image with quality scoring and optional retry.
 
     - **file**: Image file (JPEG, PNG, etc.)
     - **prompt**: Prompt type — one of: document, ocr, free_ocr, figure, describe
     - **raw**: If true, return raw output with grounding annotations
+    - **retry**: If true, retry with different enhancements on low scores
     """
     _validate_prompt(prompt)
 
     data = await file.read()
     _check_file_size(data, MAX_IMAGE_SIZE_MB, "Image")
-    image = load_image_from_bytes(data)
 
-    loop = asyncio.get_event_loop()
-    vllm_input = await loop.run_in_executor(thread_pool, preprocess_image, image, prompt)
+    # Load original image (without enhancement — retry system handles it)
+    try:
+        image = Image.open(io.BytesIO(data))
+    except Exception as e:
+        raise HTTPException(400, f"Could not decode image: {e}")
+    try:
+        image = ImageOps.exif_transpose(image)
+    except Exception:
+        pass
 
-    outputs = await _run_inference([vllm_input])
-
-    return JSONResponse(_format_result(outputs[0], raw))
+    if retry:
+        result = await _run_inference_with_retry(image, prompt)
+        if raw:
+            result["text"] = result["raw_text"]
+        return JSONResponse(result)
+    else:
+        image = enhance_scan(image).convert("RGB")
+        loop = asyncio.get_event_loop()
+        vllm_input = await loop.run_in_executor(
+            thread_pool, preprocess_image, image, prompt
+        )
+        outputs = await _run_inference([vllm_input])
+        return JSONResponse(_format_result(outputs[0], raw))
 
 
 @app.post("/ocr/image/base64")
@@ -409,14 +462,9 @@ async def ocr_image_base64(
     image_base64: str = Form(...),
     prompt: str = Form(DEFAULT_PROMPT),
     raw: bool = Form(False),
+    retry: bool = Form(True),
 ):
-    """
-    OCR a single image from base64-encoded data.
-
-    - **image_base64**: Base64-encoded image
-    - **prompt**: Prompt type
-    - **raw**: If true, return raw output with grounding annotations
-    """
+    """OCR a single image from base64-encoded data."""
     _validate_prompt(prompt)
 
     try:
@@ -425,14 +473,29 @@ async def ocr_image_base64(
         raise HTTPException(400, "Invalid base64 data")
 
     _check_file_size(data, MAX_IMAGE_SIZE_MB, "Image")
-    image = load_image_from_bytes(data)
 
-    loop = asyncio.get_event_loop()
-    vllm_input = await loop.run_in_executor(thread_pool, preprocess_image, image, prompt)
+    try:
+        image = Image.open(io.BytesIO(data))
+    except Exception as e:
+        raise HTTPException(400, f"Could not decode image: {e}")
+    try:
+        image = ImageOps.exif_transpose(image)
+    except Exception:
+        pass
 
-    outputs = await _run_inference([vllm_input])
-
-    return JSONResponse(_format_result(outputs[0], raw))
+    if retry:
+        result = await _run_inference_with_retry(image, prompt)
+        if raw:
+            result["text"] = result["raw_text"]
+        return JSONResponse(result)
+    else:
+        image = enhance_scan(image).convert("RGB")
+        loop = asyncio.get_event_loop()
+        vllm_input = await loop.run_in_executor(
+            thread_pool, preprocess_image, image, prompt
+        )
+        outputs = await _run_inference([vllm_input])
+        return JSONResponse(_format_result(outputs[0], raw))
 
 
 @app.post("/ocr/pdf")
@@ -441,14 +504,16 @@ async def ocr_pdf(
     prompt: str = Form(DEFAULT_PROMPT),
     dpi: int = Form(144),
     raw: bool = Form(False),
+    retry: bool = Form(True),
 ):
     """
-    OCR a PDF document (all pages).
+    OCR a PDF document (all pages) with per-page scoring and retry.
 
     - **file**: PDF file
     - **prompt**: Prompt type
     - **dpi**: Resolution for PDF rendering (default 144)
     - **raw**: If true, return raw output with grounding annotations
+    - **retry**: If true, retry low-scoring pages
     """
     _validate_prompt(prompt)
 
@@ -461,18 +526,41 @@ async def ocr_pdf(
     if not images:
         raise HTTPException(400, "Could not extract any pages from the PDF")
 
-    # Preprocess all pages using the shared thread pool
+    # First pass: batch all pages
     batch_inputs = await preprocess_images_batch(images, prompt)
-
     outputs = await _run_inference(batch_inputs)
 
-    pages = [
-        {
-            "page": i + 1,
-            **_format_result(output, raw),
-        }
-        for i, output in enumerate(outputs)
-    ]
+    pages = []
+    retry_indices = []
+
+    for i, output in enumerate(outputs):
+        result = _format_result(output, raw)
+        result["page"] = i + 1
+        pages.append(result)
+
+        if retry and result["score"]["composite"] < SCORE_THRESHOLD:
+            retry_indices.append(i)
+
+    # Retry low-scoring pages individually with different presets
+    for idx in retry_indices:
+        logger.info("Retrying page %d (score=%.3f < %.3f)", idx + 1, pages[idx]["score"]["composite"], SCORE_THRESHOLD)
+        # Get the original (un-enhanced) PDF page image
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        zoom = dpi / 72.0
+        matrix = fitz.Matrix(zoom, zoom)
+        pix = doc[idx].get_pixmap(matrix=matrix, alpha=False)
+        img_data = pix.tobytes("png")
+        original_img = Image.open(io.BytesIO(img_data))
+        doc.close()
+
+        retry_result = await _run_inference_with_retry(original_img, prompt)
+        retry_result["page"] = idx + 1
+        if raw:
+            retry_result["text"] = retry_result["raw_text"]
+
+        # Use retry result if it scored better
+        if retry_result.get("score", {}).get("composite", 0) > pages[idx]["score"]["composite"]:
+            pages[idx] = retry_result
 
     full_text = "\n\n---\n\n".join(p["text"] for p in pages)
 
@@ -491,13 +579,15 @@ async def ocr_batch(
     files: list[UploadFile] = File(...),
     prompt: str = Form(DEFAULT_PROMPT),
     raw: bool = Form(False),
+    retry: bool = Form(True),
 ):
     """
-    OCR multiple images in a single batch.
+    OCR multiple images in a single batch with scoring.
 
     - **files**: Multiple image files (max MAX_BATCH_SIZE)
     - **prompt**: Prompt type
     - **raw**: If true, return raw output
+    - **retry**: If true, retry low-scoring images
     """
     _validate_prompt(prompt)
 
@@ -507,8 +597,9 @@ async def ocr_batch(
             f"Too many files ({len(files)}). Maximum batch size is {MAX_BATCH_SIZE}.",
         )
 
-    # Load all images, collecting per-file errors
-    images: list[Image.Image] = []
+    # Load all images
+    raw_images: list[Image.Image] = []
+    enhanced_images: list[Image.Image] = []
     valid_indices: list[int] = []
     errors: list[dict] = []
 
@@ -516,7 +607,16 @@ async def ocr_batch(
         try:
             data = await f.read()
             _check_file_size(data, MAX_IMAGE_SIZE_MB, f"File '{f.filename}'")
-            images.append(load_image_from_bytes(data))
+            try:
+                img = Image.open(io.BytesIO(data))
+            except Exception as e:
+                raise HTTPException(400, f"Could not decode image: {e}")
+            try:
+                img = ImageOps.exif_transpose(img)
+            except Exception:
+                pass
+            raw_images.append(img)
+            enhanced_images.append(enhance_scan(img).convert("RGB"))
             valid_indices.append(i)
         except HTTPException as e:
             errors.append({"index": i, "filename": f.filename, "error": e.detail})
@@ -525,20 +625,39 @@ async def ocr_batch(
 
     results: list[dict] = []
 
-    if images:
-        batch_inputs = await preprocess_images_batch(images, prompt)
-
+    if enhanced_images:
+        batch_inputs = await preprocess_images_batch(enhanced_images, prompt)
         outputs = await _run_inference(batch_inputs)
 
+        retry_indices = []
         for j, output in enumerate(outputs):
             original_idx = valid_indices[j]
-            results.append(
-                {
-                    "index": original_idx,
-                    "filename": files[original_idx].filename,
-                    **_format_result(output, raw),
-                }
+            result = _format_result(output, raw)
+            result["index"] = original_idx
+            result["filename"] = files[original_idx].filename
+            results.append(result)
+
+            if retry and result["score"]["composite"] < SCORE_THRESHOLD:
+                retry_indices.append(j)
+
+        # Retry low-scoring images
+        for j in retry_indices:
+            original_idx = valid_indices[j]
+            logger.info(
+                "Retrying %s (score=%.3f)",
+                files[original_idx].filename,
+                results[j]["score"]["composite"],
             )
+            retry_result = await _run_inference_with_retry(
+                raw_images[j], prompt
+            )
+            if raw:
+                retry_result["text"] = retry_result["raw_text"]
+            retry_result["index"] = original_idx
+            retry_result["filename"] = files[original_idx].filename
+
+            if retry_result.get("score", {}).get("composite", 0) > results[j]["score"]["composite"]:
+                results[j] = retry_result
 
     return JSONResponse(
         {
