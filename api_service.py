@@ -47,6 +47,7 @@ from config import CROP_MODE, MAX_CONCURRENCY, NUM_WORKERS
 from deepseek_ocr import DeepseekOCRForCausalLM
 from process import (
     clean_output,
+    CleanStats,
     enhance_scan,
     enhance_scan_with_preset,
     ENHANCEMENT_PRESETS,
@@ -218,7 +219,8 @@ async def _run_inference(inputs: list[dict]) -> list:
 def _format_result(output, raw: bool) -> dict:
     """Build a consistent result dict from a single vLLM output."""
     text = output.outputs[0].text
-    cleaned = clean_output(text)
+    stats = CleanStats()
+    cleaned = clean_output(text, stats=stats)
     num_tokens = len(output.outputs[0].token_ids)
 
     # Score the result
@@ -227,6 +229,7 @@ def _format_result(output, raw: bool) -> dict:
         clean_text=cleaned,
         num_tokens=num_tokens,
         max_tokens=MAX_TOKENS,
+        clean_stats=stats,
     )
     score = score_result(ocr_result)
     flag_info = compute_flags(ocr_result, SCORE_THRESHOLD)
@@ -275,7 +278,8 @@ async def _run_inference_with_retry(
         outputs = await _run_inference([vllm_input])
 
         text = outputs[0].outputs[0].text
-        cleaned = clean_output(text)
+        retry_stats = CleanStats()
+        cleaned = clean_output(text, stats=retry_stats)
         num_tokens = len(outputs[0].outputs[0].token_ids)
 
         ocr_result = OCRResult(
@@ -284,6 +288,7 @@ async def _run_inference_with_retry(
             num_tokens=num_tokens,
             max_tokens=MAX_TOKENS,
             preset_name=preset["name"],
+            clean_stats=retry_stats,
         )
         score_result(ocr_result, other_results=results, image_width=image.width, image_height=image.height)
         results.append(ocr_result)

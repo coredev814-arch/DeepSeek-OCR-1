@@ -6,6 +6,18 @@ deduplicates sections, and normalizes the markdown output.
 
 import re
 from collections import Counter
+from dataclasses import dataclass, field
+
+
+@dataclass
+class CleanStats:
+    """Tracks what was removed during post-processing and why."""
+    dedup_chars_removed: int = 0
+    hallucination_chars_removed: int = 0
+
+    @property
+    def total_removed(self) -> int:
+        return self.dedup_chars_removed + self.hallucination_chars_removed
 
 
 # ---------------------------------------------------------------------------
@@ -264,8 +276,58 @@ def _collapse_repeating_patterns(text: str) -> str:
 # Section deduplication
 # ---------------------------------------------------------------------------
 
-def _deduplicate_sections(text: str) -> str:
-    """Remove duplicated markdown sections."""
+def _table_column_count(html: str) -> int:
+    """Count columns in the first row of a table."""
+    first_row = re.search(r"<tr>(.*?)</tr>", html, re.DOTALL)
+    if not first_row:
+        return 0
+    return len(re.findall(r"<td", first_row.group(1)))
+
+
+def _tables_are_expanded_variant(content_a: str, content_b: str) -> bool:
+    """Check if two section contents contain tables where one is an
+    expanded version of the other (same rows but more columns).
+
+    This detects the common OCR pattern where the model emits the same
+    table twice — once truncated, once with the full column set.  The
+    expanded version should be kept, and the removal should be counted
+    as dedup rather than hallucination.
+    """
+    tables_a = re.findall(r"<table>.*?</table>", content_a, re.DOTALL)
+    tables_b = re.findall(r"<table>.*?</table>", content_b, re.DOTALL)
+    if not tables_a or not tables_b:
+        return False
+
+    # Extract non-empty cell values from the largest table in each section
+    def _cell_values(html: str) -> set[str]:
+        cells = re.findall(r"<td[^>]*>([^<]+)</td>", html)
+        return {c.strip() for c in cells if c.strip()}
+
+    vals_a = _cell_values(max(tables_a, key=len))
+    vals_b = _cell_values(max(tables_b, key=len))
+
+    if not vals_a or not vals_b:
+        return False
+
+    # If the smaller set is mostly contained in the larger, they're variants
+    smaller, larger = (vals_a, vals_b) if len(vals_a) <= len(vals_b) else (vals_b, vals_a)
+    overlap = len(smaller & larger)
+    return overlap >= len(smaller) * 0.7
+
+
+def _deduplicate_sections(text: str, stats: CleanStats | None = None) -> str:
+    """Remove duplicated markdown sections.
+
+    When *stats* is provided, characters removed by deduplication are
+    tracked separately from hallucination removal so the scoring system
+    can distinguish intentional dedup from true hallucination.
+
+    Handles expanded table variants: if two sections share a header and
+    one table is a superset of the other (more columns), the larger
+    version is kept and the removal is still counted as dedup.
+    """
+    original_len = len(text)
+
     parts = re.split(r"((?:^|\n)#{1,3}\s+[^\n]+)", text)
     if len(parts) <= 2:
         return text
@@ -292,22 +354,42 @@ def _deduplicate_sections(text: str) -> str:
             result.append((header, content))
         else:
             prev_idx = seen_headers[normalized]
-            prev_content = result[prev_idx][1]
-            if len(content.strip()) > len(prev_content.strip()) * 1.2:
+            prev_header, prev_content = result[prev_idx]
+
+            # Check if this is an expanded table variant or just longer content
+            is_expanded = _tables_are_expanded_variant(prev_content, content)
+
+            if is_expanded:
+                # Keep whichever has more table columns
+                prev_cols = _table_column_count(prev_content)
+                curr_cols = _table_column_count(content)
+                if curr_cols > prev_cols:
+                    result[prev_idx] = (header, content)
+            elif len(content.strip()) > len(prev_content.strip()) * 1.2:
                 result[prev_idx] = (header, content)
 
-    return "".join(h + c for h, c in result)
+    output = "".join(h + c for h, c in result)
+
+    if stats is not None:
+        stats.dedup_chars_removed += max(0, original_len - len(output))
+
+    return output
 
 
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
-def clean_output(text: str) -> str:
+def clean_output(text: str, stats: CleanStats | None = None) -> str:
     """Remove grounding annotations and clean up the OCR output.
 
     This is the main entry point for post-processing. It applies all
     cleanup steps in order and returns normalized markdown.
+
+    If *stats* is provided, it will be populated with character counts
+    for each removal category (dedup vs hallucination) so the scoring
+    system can distinguish legitimate deduplication from true
+    hallucination.
     """
     text = text.replace("<\uff5cend\u2581of\u2581sentence\uff5c>", "")
 
@@ -321,7 +403,7 @@ def clean_output(text: str) -> str:
     text = text.replace("\\coloneqq", ":=").replace("\\eqqcolon", "=:")
     text = _collapse_empty_table_cells(text)
     text = _collapse_repeating_patterns(text)
-    text = _deduplicate_sections(text)
+    text = _deduplicate_sections(text, stats=stats)
     text = re.sub(r"\n{3,}", "\n\n", text)
     text = re.sub(r"  +", " ", text)
     return text.strip()

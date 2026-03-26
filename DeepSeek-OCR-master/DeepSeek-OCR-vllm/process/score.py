@@ -13,7 +13,10 @@ import re
 from collections import Counter
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .postprocess import CleanStats
 
 
 # ---------------------------------------------------------------------------
@@ -76,6 +79,7 @@ class OCRResult:
     max_tokens: int
     preset_name: str = "adaptive"
     score: Optional[ScoreBreakdown] = None
+    clean_stats: Optional["CleanStats"] = None
 
 
 # ---------------------------------------------------------------------------
@@ -85,15 +89,24 @@ class OCRResult:
 def _score_hallucination_ratio(result: OCRResult) -> float:
     """How much of the raw output survived post-processing.
 
-    Score = clean_chars / raw_chars.
-    A result where post-processing removed 90% of the text is mostly
-    hallucination (score ≈ 0.1). A clean result scores near 1.0.
+    Score = clean_chars / (raw_chars - dedup_chars).
+    Characters removed by section deduplication are *not* counted as
+    hallucination because duplicate sections (e.g. the model emitting
+    the same table twice with different column sets) are a structural
+    issue, not fabricated content.
     """
     raw_len = len(result.raw_text.strip())
     clean_len = len(result.clean_text.strip())
     if raw_len == 0:
         return 0.0
-    ratio = clean_len / raw_len
+
+    # Subtract chars removed by dedup — they aren't hallucination
+    dedup_removed = 0
+    if result.clean_stats is not None:
+        dedup_removed = result.clean_stats.dedup_chars_removed
+
+    effective_raw = max(raw_len - dedup_removed, clean_len)
+    ratio = clean_len / effective_raw
     return min(ratio, 1.0)
 
 
@@ -251,10 +264,16 @@ def _score_self_consistency(
     If the model produces similar text across different preprocessing
     runs, the result is likely correct. Wildly different outputs
     indicate unreliable generation.
+
+    Single-run results return 0.7 (mildly positive) rather than 0.5,
+    because a deterministic model at temperature 0.0 will produce the
+    same output for the same input — the inability to measure
+    consistency should not penalize the score as harshly as a genuine
+    inconsistency would.
     """
     if not others:
-        # Single run — can't measure consistency, return neutral
-        return 0.5
+        # Single run — can't measure consistency, return mildly positive
+        return 0.7
 
     similarities = []
     for other in others:
@@ -266,7 +285,7 @@ def _score_self_consistency(
         similarities.append(ratio)
 
     if not similarities:
-        return 0.5
+        return 0.7
 
     return sum(similarities) / len(similarities)
 
@@ -370,13 +389,28 @@ FLAG_YELLOW_THRESHOLD = 0.60  # >= 0.60 → yellow, below → red
 
 # Individual variable thresholds that can force a downgrade
 _VARIABLE_THRESHOLDS = {
-    "no_content": 10,           # clean text shorter than this → red
-    "low_content": 50,          # clean text shorter than this → informational only
-    "hallucination_ratio": 0.4, # below this → critical (forces red)
-    "token_efficiency": 0.3,    # below this → critical (forces red)
-    "repetition_density": 0.4,  # below this → warning (noted but doesn't force color)
-    "structural_integrity": 0.3,# below this → warning (noted but doesn't force color)
+    "no_content": 10,                      # clean text shorter than this → red
+    "low_content": 50,                     # clean text shorter than this → informational only
+    "hallucination_ratio": 0.4,            # below this → critical (forces red)
+    "hallucination_ratio_table_heavy": 0.3,# relaxed threshold for table-heavy docs
+    "token_efficiency": 0.3,               # below this → critical (forces red)
+    "repetition_density": 0.4,             # below this → warning (noted but doesn't force color)
+    "structural_integrity": 0.3,           # below this → warning (noted but doesn't force color)
 }
+
+
+def _is_table_heavy(result: OCRResult) -> bool:
+    """Check if the output is dominated by table content.
+
+    Table-heavy documents (forms, certifications, spreadsheets) have
+    naturally high tag-to-text ratios and more legitimate repetition,
+    so some thresholds should be relaxed for them.
+    """
+    text = result.clean_text
+    if not text:
+        return False
+    table_content = "".join(re.findall(r"<table>.*?</table>", text, re.DOTALL))
+    return len(table_content) > len(text) * 0.5
 
 
 def compute_flags(
@@ -396,7 +430,7 @@ def compute_flags(
         green  — composite >= 0.75 and no critical issues
 
     Critical issues (force red regardless of composite):
-        - hallucination_ratio below threshold
+        - hallucination_ratio below threshold (relaxed for table-heavy docs)
         - token_efficiency below threshold
 
     Warnings (informational, included in details but don't change color):
@@ -448,10 +482,21 @@ def compute_flags(
             "details": details,
         }
 
+    # --- Determine effective hallucination threshold ---
+    # Table-heavy documents (forms, certs) naturally lose more content
+    # during cleanup due to empty cells and structural tags, so the
+    # critical hallucination threshold is relaxed from 0.4 to 0.3.
+    table_heavy = _is_table_heavy(result)
+    hallucination_critical_threshold = (
+        _VARIABLE_THRESHOLDS["hallucination_ratio_table_heavy"]
+        if table_heavy
+        else _VARIABLE_THRESHOLDS["hallucination_ratio"]
+    )
+
     # --- Check individual variables for issues ---
     has_critical = False
 
-    if score.hallucination_ratio < _VARIABLE_THRESHOLDS["hallucination_ratio"]:
+    if score.hallucination_ratio < hallucination_critical_threshold:
         pct = (1 - score.hallucination_ratio) * 100
         details.append({
             "code": "possible_hallucination",

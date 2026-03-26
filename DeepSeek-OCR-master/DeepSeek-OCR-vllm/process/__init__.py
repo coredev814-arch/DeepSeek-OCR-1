@@ -8,7 +8,7 @@ Modules:
     score          — Weighted multi-variable quality scoring system
 """
 
-from .postprocess import clean_output
+from .postprocess import clean_output, CleanStats
 from .enhance import enhance_scan, enhance_scan_with_preset, ENHANCEMENT_PRESETS
 from .score import (
     OCRResult,
@@ -27,6 +27,7 @@ from .score import (
 __all__ = [
     # Postprocess
     "clean_output",
+    "CleanStats",
     # Enhancement
     "enhance_scan",
     "enhance_scan_with_preset",
