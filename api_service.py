@@ -54,6 +54,7 @@ from process import (
     score_result,
     select_best_result,
     needs_retry,
+    compute_flags,
     DEFAULT_THRESHOLD,
     DEFAULT_MAX_RETRIES,
 )
@@ -75,7 +76,7 @@ logger = logging.getLogger("deepseek-ocr")
 # Configuration
 # ---------------------------------------------------------------------------
 MODEL_PATH = os.environ.get("MODEL_PATH", "/workspace/models/DeepSeek-OCR")
-GPU_MEM_UTIL = float(os.environ.get("GPU_MEM_UTIL", "0.9"))
+GPU_MEM_UTIL = float(os.environ.get("GPU_MEM_UTIL", "0.75"))
 MAX_MODEL_LEN = int(os.environ.get("MAX_MODEL_LEN", "8192"))
 MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "8192"))
 HOST = os.environ.get("HOST", "0.0.0.0")
@@ -228,12 +229,16 @@ def _format_result(output, raw: bool) -> dict:
         max_tokens=MAX_TOKENS,
     )
     score = score_result(ocr_result)
+    flag_info = compute_flags(ocr_result, SCORE_THRESHOLD)
 
     return {
         "text": text if raw else cleaned,
         "raw_text": text,
         "num_tokens": num_tokens,
         "score": score.to_dict(),
+        "flag": flag_info["flag"],
+        "flag_message": flag_info["message"],
+        "flag_details": flag_info["details"],
     }
 
 
@@ -296,12 +301,16 @@ async def _run_inference_with_retry(
             break
 
     best = select_best_result(results)
+    flag_info = compute_flags(best, SCORE_THRESHOLD)
 
     return {
         "text": best.clean_text,
         "raw_text": best.raw_text,
         "num_tokens": best.num_tokens,
         "score": best.score.to_dict() if best.score else None,
+        "flag": flag_info["flag"],
+        "flag_message": flag_info["message"],
+        "flag_details": flag_info["details"],
         "attempts": len(results),
         "preset": best.preset_name,
     }
@@ -564,12 +573,28 @@ async def ocr_pdf(
 
     full_text = "\n\n---\n\n".join(p["text"] for p in pages)
 
+    # Build summary by flag color
+    summary = {"green": 0, "yellow": 0, "red": 0}
+    flagged_pages = []
+    for p in pages:
+        color = p.get("flag", "yellow")
+        summary[color] = summary.get(color, 0) + 1
+        if color in ("yellow", "red"):
+            flagged_pages.append({
+                "page": p["page"],
+                "flag": color,
+                "flag_message": p.get("flag_message"),
+                "score": p["score"]["composite"] if p.get("score") else None,
+            })
+
     return JSONResponse(
         {
             "num_pages": len(pages),
             "pages": pages,
             "full_text": full_text,
             "total_tokens": sum(p["num_tokens"] for p in pages),
+            "summary": summary,
+            "flagged_pages": flagged_pages,
         }
     )
 
@@ -659,6 +684,21 @@ async def ocr_batch(
             if retry_result.get("score", {}).get("composite", 0) > results[j]["score"]["composite"]:
                 results[j] = retry_result
 
+    # Build summary by flag color
+    summary = {"green": 0, "yellow": 0, "red": 0}
+    flagged_results = []
+    for r in results:
+        color = r.get("flag", "yellow")
+        summary[color] = summary.get(color, 0) + 1
+        if color in ("yellow", "red"):
+            flagged_results.append({
+                "index": r.get("index"),
+                "filename": r.get("filename"),
+                "flag": color,
+                "flag_message": r.get("flag_message"),
+                "score": r["score"]["composite"] if r.get("score") else None,
+            })
+
     return JSONResponse(
         {
             "results": results,
@@ -666,6 +706,8 @@ async def ocr_batch(
             "total": len(files),
             "succeeded": len(results),
             "failed": len(errors),
+            "summary": summary,
+            "flagged_results": flagged_results,
         }
     )
 

@@ -16,9 +16,12 @@ from .score import (
     score_result,
     select_best_result,
     needs_retry,
+    compute_flags,
     DEFAULT_THRESHOLD,
     DEFAULT_MAX_RETRIES,
     DEFAULT_WEIGHTS,
+    FLAG_GREEN_THRESHOLD,
+    FLAG_YELLOW_THRESHOLD,
 )
 
 __all__ = [
@@ -28,12 +31,13 @@ __all__ = [
     "enhance_scan",
     "enhance_scan_with_preset",
     "ENHANCEMENT_PRESETS",
-    # Scoring
+    # Scoring & Flagging
     "OCRResult",
     "ScoreBreakdown",
     "score_result",
     "select_best_result",
     "needs_retry",
+    "compute_flags",
     "DEFAULT_THRESHOLD",
     "DEFAULT_MAX_RETRIES",
     "DEFAULT_WEIGHTS",

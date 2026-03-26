@@ -181,6 +181,56 @@ def _collapse_empty_table_cells(text: str) -> str:
 
     text = re.sub(r"<table>.*?</table>", _trim_repetitive_table, text, flags=re.DOTALL)
 
+    # Remove tables dominated by a single repeated cell value
+    # (diagonal repetition: same text appears across different columns in many rows)
+    def _trim_diagonal_repetition(match: re.Match) -> str:
+        table_html = match.group(0)
+        rows = re.findall(r"<tr>.*?</tr>", table_html, re.DOTALL)
+        if len(rows) <= 5:
+            return table_html
+
+        # Collect all non-empty cell values across the table
+        all_cell_values = []
+        for row in rows:
+            cells = re.findall(r"<td[^>]*>(.*?)</td>", row, re.DOTALL)
+            for c in cells:
+                stripped = c.strip()
+                if stripped:
+                    all_cell_values.append(stripped)
+
+        if not all_cell_values:
+            return table_html
+
+        # Check if a single value dominates >40% of all non-empty cells
+        # and appears in more than 5 rows
+        value_counts = Counter(all_cell_values)
+        most_common_val, most_common_count = value_counts.most_common(1)[0]
+
+        # Count how many rows contain this value
+        rows_with_value = 0
+        for row in rows:
+            if most_common_val in row:
+                rows_with_value += 1
+
+        if most_common_count >= 5 and rows_with_value > len(rows) * 0.4:
+            # This value is a hallucinated repeat — remove rows that ONLY
+            # contain this value (plus empty cells)
+            kept = []
+            for row in rows:
+                cells = re.findall(r"<td[^>]*>(.*?)</td>", row, re.DOTALL)
+                non_empty = [c.strip() for c in cells if c.strip()]
+                unique_values = set(non_empty)
+                # Keep rows that have content OTHER than the repeated value
+                if not non_empty or unique_values - {most_common_val}:
+                    kept.append(row)
+            if not kept:
+                return ""
+            return "<table>" + "".join(kept) + "</table>"
+
+        return table_html
+
+    text = re.sub(r"<table>.*?</table>", _trim_diagonal_repetition, text, flags=re.DOTALL)
+
     # Remove empty tables
     text = re.sub(r"<table>\s*</table>", "", text)
 
