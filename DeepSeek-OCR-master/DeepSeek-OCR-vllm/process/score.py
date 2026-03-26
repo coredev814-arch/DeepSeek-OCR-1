@@ -177,8 +177,16 @@ def _score_repetition_density(result: OCRResult) -> float:
 
     Even after post-processing, some subtle repetitions may remain.
     This measures how much of the text is repetitive.
+
+    HTML/XML tags are stripped before analysis because table markup
+    (``<td>``, ``<tr>``, etc.) is naturally repetitive and would
+    otherwise produce false positives on structured documents.
     """
-    text = result.clean_text
+    # Strip HTML tags so table markup doesn't count as repetition
+    text = re.sub(r"<[^>]+>", " ", result.clean_text)
+    # Collapse whitespace left by tag removal
+    text = re.sub(r"\s+", " ", text).strip()
+
     if len(text) < 50:
         return 0.5  # too short to judge
 
@@ -350,3 +358,145 @@ def needs_retry(
     if result.score is None:
         return True
     return result.score.composite < threshold
+
+
+# ---------------------------------------------------------------------------
+# Flagging — Green / Yellow / Red quality flags
+# ---------------------------------------------------------------------------
+
+# Composite score boundaries for color flags
+FLAG_GREEN_THRESHOLD = 0.75   # >= 0.75 → green
+FLAG_YELLOW_THRESHOLD = 0.60  # >= 0.60 → yellow, below → red
+
+# Individual variable thresholds that can force a downgrade
+_VARIABLE_THRESHOLDS = {
+    "no_content": 10,           # clean text shorter than this → red
+    "low_content": 50,          # clean text shorter than this → informational only
+    "hallucination_ratio": 0.4, # below this → critical (forces red)
+    "token_efficiency": 0.3,    # below this → critical (forces red)
+    "repetition_density": 0.4,  # below this → warning (noted but doesn't force color)
+    "structural_integrity": 0.3,# below this → warning (noted but doesn't force color)
+}
+
+
+def compute_flags(
+    result: OCRResult,
+    threshold: float = DEFAULT_THRESHOLD,
+) -> dict:
+    """Compute a Green/Yellow/Red quality flag for an OCR result.
+
+    Returns a dict with:
+        - flag: "green", "yellow", or "red"
+        - message: short summary for the flag color
+        - details: list of individual issue dicts (code + message + severity)
+
+    Flag logic (applied in order):
+        red    — no content, critical issues, OR composite < 0.60
+        yellow — composite between 0.60 and 0.75
+        green  — composite >= 0.75 and no critical issues
+
+    Critical issues (force red regardless of composite):
+        - hallucination_ratio below threshold
+        - token_efficiency below threshold
+
+    Warnings (informational, included in details but don't change color):
+        - repetition_density below threshold
+        - structural_integrity below threshold
+        - low content length
+
+    Args:
+        result: A scored OCRResult.
+        threshold: Composite score threshold (unused, reserved for future use).
+
+    Returns:
+        Flag dict with color, message, and details.
+    """
+    details: list[dict] = []
+    clean_len = len(result.clean_text.strip())
+    score = result.score
+
+    # --- No content → always red ---
+    if clean_len <= _VARIABLE_THRESHOLDS["no_content"]:
+        return {
+            "flag": "red",
+            "message": "No meaningful text extracted. Manual review required.",
+            "details": [{
+                "code": "no_content",
+                "severity": "critical",
+                "message": "No meaningful text was extracted from this page.",
+            }],
+        }
+
+    # --- Very little content (informational — doesn't affect flag color) ---
+    if clean_len < _VARIABLE_THRESHOLDS["low_content"]:
+        details.append({
+            "code": "low_content",
+            "severity": "info",
+            "message": f"Very little text extracted ({clean_len} chars). Page may be mostly blank or handwritten.",
+        })
+
+    # --- Unscored → yellow ---
+    if score is None:
+        details.append({
+            "code": "unscored",
+            "severity": "warning",
+            "message": "Page was not scored — quality is unknown.",
+        })
+        return {
+            "flag": "yellow",
+            "message": "Quality could not be determined. Spot-check recommended.",
+            "details": details,
+        }
+
+    # --- Check individual variables for issues ---
+    has_critical = False
+
+    if score.hallucination_ratio < _VARIABLE_THRESHOLDS["hallucination_ratio"]:
+        pct = (1 - score.hallucination_ratio) * 100
+        details.append({
+            "code": "possible_hallucination",
+            "severity": "critical",
+            "message": f"~{pct:.0f}% of raw output was removed as hallucinated content.",
+        })
+        has_critical = True
+
+    if score.token_efficiency < _VARIABLE_THRESHOLDS["token_efficiency"]:
+        details.append({
+            "code": "max_tokens_hit",
+            "severity": "critical",
+            "message": "Model hit token limit with little clean output — likely stuck in a generation loop.",
+        })
+        has_critical = True
+
+    if score.repetition_density < _VARIABLE_THRESHOLDS["repetition_density"]:
+        details.append({
+            "code": "repetitive_content",
+            "severity": "warning",
+            "message": "Output contains repetitive patterns that may indicate hallucination.",
+        })
+
+    if score.structural_integrity < _VARIABLE_THRESHOLDS["structural_integrity"]:
+        details.append({
+            "code": "no_structure",
+            "severity": "warning",
+            "message": "No recognizable document structure (headers, tables, paragraphs) detected.",
+        })
+
+    # --- Determine color from composite + critical issues ---
+    composite = score.composite
+
+    if composite < FLAG_YELLOW_THRESHOLD or has_critical:
+        flag = "red"
+        message = f"Low quality score ({composite:.2f}). Manual review required."
+    elif composite < FLAG_GREEN_THRESHOLD:
+        flag = "yellow"
+        message = f"Borderline quality score ({composite:.2f}). Spot-check recommended."
+    else:
+        flag = "green"
+        message = f"Good quality ({composite:.2f})."
+
+    return {
+        "flag": flag,
+        "message": message,
+        "details": details,
+    }
