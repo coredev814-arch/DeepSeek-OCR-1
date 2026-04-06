@@ -1,12 +1,18 @@
 """Weighted multi-variable scoring system for OCR output quality.
 
+General-purpose scoring designed for diverse document types: forms,
+letters, reports, invoices, receipts, legal documents, handwritten
+notes, certificates, spreadsheets, etc.
+
 Evaluates OCR results using multiple independent metrics, each with
 its own weight. The composite score determines whether a result is
 acceptable or needs to be retried with different preprocessing.
 
-Design principle: many variables with individual weights ensure that
-no single metric dominates — a change in one variable has a bounded
-effect on the final score.
+Design principles:
+- No assumption about document structure (headers, tables, etc.)
+- Coordinate/grounding tags stripped during cleaning are NOT hallucination
+- Natural text repetition (legal boilerplate, form labels) is expected
+- Single-run deterministic inference should not be penalized
 """
 
 import re
@@ -24,12 +30,12 @@ if TYPE_CHECKING:
 # ---------------------------------------------------------------------------
 
 DEFAULT_WEIGHTS = {
-    "self_consistency": 0.30,
+    "self_consistency": 0.20,
     "hallucination_ratio": 0.25,
-    "token_efficiency": 0.15,
-    "structural_integrity": 0.15,
+    "token_efficiency": 0.20,
+    "structural_integrity": 0.10,
     "repetition_density": 0.10,
-    "content_density": 0.05,
+    "content_density": 0.15,
 }
 
 # Quality threshold — results below this are candidates for retry
@@ -83,29 +89,57 @@ class OCRResult:
 
 
 # ---------------------------------------------------------------------------
+# Tag measurement — separates grounding tags from real content
+# ---------------------------------------------------------------------------
+
+# Patterns that are expected model output format, not hallucination
+_GROUNDING_TAG_PATTERN = re.compile(
+    r"<\|ref\|>.*?<\|/ref\|>"
+    r"|<\|det\|>.*?<\|/det\|>"
+    r"|<\uff5cend\u2581of\u2581sentence\uff5c>"
+    r"|\[\[\d+,\s*\d+,\s*\d+,\s*\d+\]\]"
+)
+
+
+def _measure_grounding_tags(raw_text: str) -> int:
+    """Count characters in the raw text that are grounding/coordinate tags.
+
+    These tags are expected output format and their removal during
+    cleaning should not be counted as hallucination.
+    """
+    return sum(len(m.group()) for m in _GROUNDING_TAG_PATTERN.finditer(raw_text))
+
+
+# ---------------------------------------------------------------------------
 # Individual scoring variables (each returns 0.0 - 1.0)
 # ---------------------------------------------------------------------------
 
 def _score_hallucination_ratio(result: OCRResult) -> float:
     """How much of the raw output survived post-processing.
 
-    Score = clean_chars / (raw_chars - dedup_chars).
-    Characters removed by section deduplication are *not* counted as
-    hallucination because duplicate sections (e.g. the model emitting
-    the same table twice with different column sets) are a structural
-    issue, not fabricated content.
+    Excludes grounding tags and dedup-removed content from the
+    denominator, since neither represents fabricated content.
+
+    For general documents: the ratio measures clean_chars / effective_raw,
+    where effective_raw = raw - tags - dedup.
     """
     raw_len = len(result.raw_text.strip())
     clean_len = len(result.clean_text.strip())
     if raw_len == 0:
         return 0.0
 
-    # Subtract chars removed by dedup — they aren't hallucination
+    # Subtract characters that are expected format, not hallucination
+    tag_chars = _measure_grounding_tags(result.raw_text)
     dedup_removed = 0
     if result.clean_stats is not None:
         dedup_removed = result.clean_stats.dedup_chars_removed
 
-    effective_raw = max(raw_len - dedup_removed, clean_len)
+    effective_raw = raw_len - tag_chars - dedup_removed
+    # If after removing tags the effective raw is smaller than clean,
+    # that means almost everything was tags — score is perfect
+    if effective_raw <= clean_len:
+        return 1.0
+
     ratio = clean_len / effective_raw
     return min(ratio, 1.0)
 
@@ -113,8 +147,9 @@ def _score_hallucination_ratio(result: OCRResult) -> float:
 def _score_token_efficiency(result: OCRResult) -> float:
     """Penalize max-token runs with little clean output.
 
-    If the model generated max_tokens (e.g., 7280/8192) but the clean
-    output is tiny, the model was stuck in a hallucination loop.
+    If the model generated max_tokens but the clean output is tiny,
+    the model was stuck in a hallucination loop. Applies a smooth
+    curve rather than hard cutoffs.
     """
     token_ratio = result.num_tokens / result.max_tokens
     clean_len = len(result.clean_text.strip())
@@ -124,101 +159,104 @@ def _score_token_efficiency(result: OCRResult) -> float:
         return 1.0
 
     # Model hit or nearly hit max tokens — check if output is substantial
-    # A good max-token result should have proportional clean content
-    # Expect at least ~2 clean chars per token for good output
     expected_min_chars = result.num_tokens * 0.5
     if clean_len >= expected_min_chars:
-        return 0.8  # hit max but has real content
-    if clean_len >= expected_min_chars * 0.3:
-        return 0.4  # some content but mostly hallucination
-    return 0.1  # max tokens with almost no real content
+        return 0.9  # hit max but has real content — normal for dense docs
+    ratio = clean_len / expected_min_chars if expected_min_chars > 0 else 0
+    # Smooth curve: 0.9 at ratio=1.0 down to 0.1 at ratio=0
+    return max(0.1, 0.9 * ratio)
 
 
 def _score_structural_integrity(result: OCRResult) -> float:
-    """Check for expected structural elements in the output.
+    """Check for recognizable content patterns in the output.
 
-    Documents should contain recognizable structure: headers, tables,
-    paragraphs, etc. A result with none of these is likely garbage.
+    General-purpose: does NOT require any specific structure type.
+    Awards credit for ANY recognizable pattern — a plain text letter
+    scores just as well as a complex form with tables.
     """
     text = result.clean_text
     if not text.strip():
         return 0.0
 
     signals = 0.0
-    checks = 0
 
     # Has markdown headers?
-    checks += 1
     if re.search(r"#{1,3}\s+\S", text):
         signals += 1.0
 
-    # Has table structure?
-    checks += 1
+    # Has table structure with real content?
     tables = re.findall(r"<table>.*?</table>", text, re.DOTALL)
     if tables:
-        # Check tables aren't just empty shells
         for table in tables:
             content_cells = re.findall(r"<td[^>]*>([^<]+)</td>", table)
-            if len(content_cells) >= 3:
+            if len(content_cells) >= 2:
                 signals += 1.0
                 break
         else:
-            signals += 0.3  # tables exist but sparse
+            signals += 0.3
 
-    # Has meaningful paragraphs (>50 chars of non-table text)?
-    checks += 1
-    non_table = re.sub(r"<table>.*?</table>", "", text, flags=re.DOTALL)
-    non_table = re.sub(r"<[^>]+>", "", non_table)
-    if len(non_table.strip()) > 50:
+    # Has meaningful text (>30 chars of non-markup text)?
+    non_markup = re.sub(r"<[^>]+>", "", text)
+    non_markup = re.sub(r"#{1,3}\s+", "", non_markup).strip()
+    if len(non_markup) > 30:
         signals += 1.0
 
-    # Has recognizable data patterns (dates, dollar amounts, names)?
-    checks += 1
+    # Has recognizable data patterns (dates, amounts, names, emails, phones)?
     data_patterns = (
-        re.search(r"\d{1,2}/\d{1,2}/\d{2,4}", text)  # dates
-        or re.search(r"\$[\d,]+\.\d{2}", text)         # dollar amounts
-        or re.search(r"[A-Z][a-z]+ [A-Z][a-z]+", text) # proper names
+        re.search(r"\d{1,2}/\d{1,2}/\d{2,4}", text)      # dates
+        or re.search(r"\$[\d,]+\.?\d*", text)               # dollar amounts
+        or re.search(r"[A-Z][a-z]+ [A-Z][a-z]+", text)     # proper names
+        or re.search(r"\S+@\S+\.\S+", text)                 # emails
+        or re.search(r"\d{3}[-.\s]?\d{3}[-.\s]?\d{4}", text)  # phone numbers
     )
     if data_patterns:
         signals += 1.0
 
-    return signals / checks if checks > 0 else 0.0
+    # Normalize: any 1 signal is enough for a decent score.
+    # 1 signal = 0.75, 2 = 0.875, 3 = 0.95, 4 = 1.0
+    max_signals = 4.0
+    if signals >= max_signals:
+        return 1.0
+    if signals >= 1.0:
+        return 0.5 + 0.5 * (signals / max_signals)
+    # No signals at all — but if there's substantial text, still give partial credit
+    if len(non_markup) > 100:
+        return 0.4
+    return 0.25
 
 
 def _score_repetition_density(result: OCRResult) -> float:
     """Detect remaining repetitive patterns in the clean output.
 
-    Even after post-processing, some subtle repetitions may remain.
-    This measures how much of the text is repetitive.
-
-    HTML/XML tags are stripped before analysis because table markup
-    (``<td>``, ``<tr>``, etc.) is naturally repetitive and would
-    otherwise produce false positives on structured documents.
+    Strips HTML/XML tags before analysis since table markup is naturally
+    repetitive. Uses longer n-gram windows and a higher repeat threshold
+    to avoid false positives on documents with natural repetition
+    (legal text, form labels, financial data).
     """
-    # Strip HTML tags so table markup doesn't count as repetition
+    # Strip HTML tags so table markup doesn't count
     text = re.sub(r"<[^>]+>", " ", result.clean_text)
-    # Collapse whitespace left by tag removal
     text = re.sub(r"\s+", " ", text).strip()
 
-    if len(text) < 50:
-        return 0.5  # too short to judge
+    if len(text) < 100:
+        return 1.0  # too short to judge — assume OK
 
-    # Check for repeated short sequences (3-10 chars)
+    # Only check longer sequences (6+ chars) to avoid matching common
+    # short words/phrases that repeat naturally in any document
     total_repeated = 0
-    for seq_len in [3, 5, 8, 10]:
+    for seq_len in [6, 10, 15, 20]:
         seen = Counter()
         for i in range(len(text) - seq_len):
             chunk = text[i:i + seq_len]
             if chunk.strip():
                 seen[chunk] += 1
-        # Count chars in sequences that appear 5+ times
+        # Only count sequences that appear 8+ times (higher bar)
         for chunk, count in seen.items():
-            if count >= 5:
+            if count >= 8:
                 total_repeated += len(chunk) * (count - 1)
 
     repetition_ratio = total_repeated / len(text) if text else 0
-    # Clamp — some repetition is normal in structured docs
-    return max(0.0, 1.0 - repetition_ratio * 0.5)
+    # More forgiving: scale factor 0.3 instead of 0.5
+    return max(0.0, 1.0 - repetition_ratio * 0.3)
 
 
 def _score_content_density(
@@ -229,30 +267,32 @@ def _score_content_density(
     """Ratio of clean text to image area.
 
     Very short output from a large image suggests the model failed
-    to extract most of the content.
+    to extract most of the content. Uses smooth scaling rather than
+    hard cutoffs to handle diverse document types — a short receipt
+    and a dense legal page are both valid.
     """
     clean_len = len(result.clean_text.strip())
 
     if clean_len == 0:
         return 0.0
 
-    # Without image dimensions, use absolute thresholds
-    if image_width == 0 or image_height == 0:
-        if clean_len >= 1000:
-            return 1.0
-        if clean_len >= 500:
-            return 0.8
-        if clean_len >= 200:
-            return 0.5
-        if clean_len >= 50:
-            return 0.3
-        return 0.1
+    # With image dimensions: use pixel-to-char ratio
+    if image_width > 0 and image_height > 0:
+        image_area = image_width * image_height
+        # Expect roughly 1 char per 200 pixels for average documents
+        # (more forgiving than 1:100 — handles sparse docs like receipts)
+        expected_chars = image_area / 200
+        ratio = clean_len / expected_chars
+        return min(ratio, 1.0)
 
-    # With dimensions: expect ~1 char per 100 pixels for document images
-    image_area = image_width * image_height
-    expected_chars = image_area / 100
-    ratio = clean_len / expected_chars
-    return min(ratio, 1.0)
+    # Without dimensions: smooth curve based on absolute char count
+    if clean_len >= 500:
+        return 1.0
+    if clean_len >= 100:
+        return 0.5 + 0.5 * ((clean_len - 100) / 400)
+    if clean_len >= 20:
+        return 0.2 + 0.3 * ((clean_len - 20) / 80)
+    return 0.1
 
 
 def _score_self_consistency(
@@ -265,15 +305,13 @@ def _score_self_consistency(
     runs, the result is likely correct. Wildly different outputs
     indicate unreliable generation.
 
-    Single-run results return 0.7 (mildly positive) rather than 0.5,
-    because a deterministic model at temperature 0.0 will produce the
-    same output for the same input — the inability to measure
-    consistency should not penalize the score as harshly as a genuine
-    inconsistency would.
+    Single-run results return 1.0 because a deterministic model at
+    temperature 0 will always produce the same output for the same
+    input — the inability to measure consistency should not penalize
+    the score at all.
     """
     if not others:
-        # Single run — can't measure consistency, return mildly positive
-        return 0.7
+        return 1.0
 
     similarities = []
     for other in others:
@@ -285,7 +323,7 @@ def _score_self_consistency(
         similarities.append(ratio)
 
     if not similarities:
-        return 0.7
+        return 1.0
 
     return sum(similarities) / len(similarities)
 
@@ -384,33 +422,8 @@ def needs_retry(
 # ---------------------------------------------------------------------------
 
 # Composite score boundaries for color flags
-FLAG_GREEN_THRESHOLD = 0.75   # >= 0.75 → green
-FLAG_YELLOW_THRESHOLD = 0.60  # >= 0.60 → yellow, below → red
-
-# Individual variable thresholds that can force a downgrade
-_VARIABLE_THRESHOLDS = {
-    "no_content": 10,                      # clean text shorter than this → red
-    "low_content": 50,                     # clean text shorter than this → informational only
-    "hallucination_ratio": 0.4,            # below this → critical (forces red)
-    "hallucination_ratio_table_heavy": 0.3,# relaxed threshold for table-heavy docs
-    "token_efficiency": 0.3,               # below this → critical (forces red)
-    "repetition_density": 0.4,             # below this → warning (noted but doesn't force color)
-    "structural_integrity": 0.3,           # below this → warning (noted but doesn't force color)
-}
-
-
-def _is_table_heavy(result: OCRResult) -> bool:
-    """Check if the output is dominated by table content.
-
-    Table-heavy documents (forms, certifications, spreadsheets) have
-    naturally high tag-to-text ratios and more legitimate repetition,
-    so some thresholds should be relaxed for them.
-    """
-    text = result.clean_text
-    if not text:
-        return False
-    table_content = "".join(re.findall(r"<table>.*?</table>", text, re.DOTALL))
-    return len(table_content) > len(text) * 0.5
+FLAG_GREEN_THRESHOLD = 0.70   # >= 0.70 → green
+FLAG_YELLOW_THRESHOLD = 0.50  # >= 0.50 → yellow, below → red
 
 
 def compute_flags(
@@ -425,17 +438,16 @@ def compute_flags(
         - details: list of individual issue dicts (code + message + severity)
 
     Flag logic (applied in order):
-        red    — no content, critical issues, OR composite < 0.60
-        yellow — composite between 0.60 and 0.75
-        green  — composite >= 0.75 and no critical issues
+        red    — no content OR composite < 0.50
+        yellow — composite between 0.50 and 0.70, OR green demoted by warning
+        green  — composite >= 0.70
 
-    Critical issues (force red regardless of composite):
-        - hallucination_ratio below threshold (relaxed for table-heavy docs)
-        - token_efficiency below threshold
+    Warnings (downgrade by one level: green→yellow, yellow stays yellow):
+        - hallucination_ratio below 0.25 (severe — most content may be fabricated)
+        - token_efficiency below 0.2 (model stuck in generation loop)
 
-    Warnings (informational, included in details but don't change color):
+    Informational (included in details but don't change color):
         - repetition_density below threshold
-        - structural_integrity below threshold
         - low content length
 
     Args:
@@ -450,7 +462,7 @@ def compute_flags(
     score = result.score
 
     # --- No content → always red ---
-    if clean_len <= _VARIABLE_THRESHOLDS["no_content"]:
+    if clean_len <= 10:
         return {
             "flag": "red",
             "message": "No meaningful text extracted. Manual review required.",
@@ -461,8 +473,8 @@ def compute_flags(
             }],
         }
 
-    # --- Very little content (informational — doesn't affect flag color) ---
-    if clean_len < _VARIABLE_THRESHOLDS["low_content"]:
+    # --- Very little content (informational) ---
+    if clean_len < 30:
         details.append({
             "code": "low_content",
             "severity": "info",
@@ -482,55 +494,47 @@ def compute_flags(
             "details": details,
         }
 
-    # --- Determine effective hallucination threshold ---
-    # Table-heavy documents (forms, certs) naturally lose more content
-    # during cleanup due to empty cells and structural tags, so the
-    # critical hallucination threshold is relaxed from 0.4 to 0.3.
-    table_heavy = _is_table_heavy(result)
-    hallucination_critical_threshold = (
-        _VARIABLE_THRESHOLDS["hallucination_ratio_table_heavy"]
-        if table_heavy
-        else _VARIABLE_THRESHOLDS["hallucination_ratio"]
-    )
+    # --- Check for warnings (downgrade one level, not force red) ---
+    has_warning = False
 
-    # --- Check individual variables for issues ---
-    has_critical = False
-
-    if score.hallucination_ratio < hallucination_critical_threshold:
+    # Flag hallucination if severe (>75% removed after excluding tags)
+    if score.hallucination_ratio < 0.25:
         pct = (1 - score.hallucination_ratio) * 100
         details.append({
             "code": "possible_hallucination",
-            "severity": "critical",
-            "message": f"~{pct:.0f}% of raw output was removed as hallucinated content.",
+            "severity": "warning",
+            "message": f"~{pct:.0f}% of output was removed as hallucinated content.",
         })
-        has_critical = True
+        has_warning = True
 
-    if score.token_efficiency < _VARIABLE_THRESHOLDS["token_efficiency"]:
+    # Flag token efficiency if extreme
+    if score.token_efficiency < 0.2:
         details.append({
             "code": "max_tokens_hit",
-            "severity": "critical",
-            "message": "Model hit token limit with little clean output — likely stuck in a generation loop.",
+            "severity": "warning",
+            "message": "Model hit token limit with very little clean output — likely stuck in a generation loop.",
         })
-        has_critical = True
+        has_warning = True
 
-    if score.repetition_density < _VARIABLE_THRESHOLDS["repetition_density"]:
+    # --- Informational (don't change flag color) ---
+    if score.repetition_density < 0.4:
         details.append({
             "code": "repetitive_content",
-            "severity": "warning",
+            "severity": "info",
             "message": "Output contains repetitive patterns that may indicate hallucination.",
         })
 
-    if score.structural_integrity < _VARIABLE_THRESHOLDS["structural_integrity"]:
+    if score.content_density < 0.15:
         details.append({
-            "code": "no_structure",
-            "severity": "warning",
-            "message": "No recognizable document structure (headers, tables, paragraphs) detected.",
+            "code": "sparse_content",
+            "severity": "info",
+            "message": "Extracted text is very short relative to image size.",
         })
 
-    # --- Determine color from composite + critical issues ---
+    # --- Determine color from composite score ---
     composite = score.composite
 
-    if composite < FLAG_YELLOW_THRESHOLD or has_critical:
+    if composite < FLAG_YELLOW_THRESHOLD:
         flag = "red"
         message = f"Low quality score ({composite:.2f}). Manual review required."
     elif composite < FLAG_GREEN_THRESHOLD:
@@ -539,6 +543,12 @@ def compute_flags(
     else:
         flag = "green"
         message = f"Good quality ({composite:.2f})."
+
+    # --- Warnings downgrade by one level (green→yellow, yellow stays) ---
+    if has_warning:
+        if flag == "green":
+            flag = "yellow"
+            message = f"Score OK ({composite:.2f}) but has warnings. Spot-check recommended."
 
     return {
         "flag": flag,
