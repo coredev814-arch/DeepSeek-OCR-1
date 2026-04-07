@@ -366,7 +366,7 @@ def score_result(
         result, image_width, image_height
     )
 
-    breakdown.composite = (
+    composite = (
         w["self_consistency"] * breakdown.self_consistency
         + w["hallucination_ratio"] * breakdown.hallucination_ratio
         + w["token_efficiency"] * breakdown.token_efficiency
@@ -374,6 +374,17 @@ def score_result(
         + w["repetition_density"] * breakdown.repetition_density
         + w["content_density"] * breakdown.content_density
     )
+
+    # Cap score for blank/near-blank pages — metrics like self_consistency
+    # and token_efficiency return perfect scores on empty output, inflating
+    # the composite. Hard cap ensures the number matches reality.
+    clean_len = len(result.clean_text.strip())
+    if clean_len <= 10:
+        composite = min(composite, 0.10)
+    elif clean_len <= 30:
+        composite = min(composite, 0.30)
+
+    breakdown.composite = composite
 
     result.score = breakdown
     return breakdown
@@ -395,7 +406,7 @@ def select_best_result(results: list[OCRResult]) -> OCRResult:
                 result, others
             )
             w = result.score.weights
-            result.score.composite = (
+            composite = (
                 w["self_consistency"] * result.score.self_consistency
                 + w["hallucination_ratio"] * result.score.hallucination_ratio
                 + w["token_efficiency"] * result.score.token_efficiency
@@ -403,6 +414,13 @@ def select_best_result(results: list[OCRResult]) -> OCRResult:
                 + w["repetition_density"] * result.score.repetition_density
                 + w["content_density"] * result.score.content_density
             )
+            # Apply same blank-page cap as score_result
+            clean_len = len(result.clean_text.strip())
+            if clean_len <= 10:
+                composite = min(composite, 0.10)
+            elif clean_len <= 30:
+                composite = min(composite, 0.30)
+            result.score.composite = composite
 
     return max(results, key=lambda r: r.score.composite if r.score else 0.0)
 
