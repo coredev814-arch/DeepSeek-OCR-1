@@ -2,18 +2,8 @@
 DeepSeek-OCR API Service
 Production-ready FastAPI service for RunPod deployment.
 
-Changes from original:
-- asyncio.Semaphore guards all GPU inference (prevents concurrent llm.generate crashes)
-- Modern FastAPI lifespan replaces deprecated @app.on_event("startup")
-- Graceful shutdown cleans up ThreadPoolExecutor and GPU memory
-- File size limits prevent OOM from oversized uploads
-- Per-request timeout via asyncio.wait_for
-- Batch endpoint returns partial results on per-item failures
-- Removed nested ThreadPoolExecutor creation inside requests
-- Fixed uvicorn workers locked to 1 (multi-process would duplicate the model)
-- Consistent response schema for raw/non-raw modes
-- Structured logging replaces print statements
-- Modular scoring/retry system for quality assurance
+Uses vLLM AsyncLLMEngine for concurrent inference — multiple requests
+are batched on the GPU automatically without semaphore serialization.
 """
 
 import asyncio
@@ -23,7 +13,7 @@ import logging
 import os
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor
+import uuid
 from contextlib import asynccontextmanager
 from typing import Optional
 
@@ -64,7 +54,9 @@ from process import (
 )
 from process.image_process import DeepseekOCRProcessor
 from process.ngram_norepeat import NoRepeatNGramLogitsProcessor
-from vllm import LLM, SamplingParams
+from vllm import SamplingParams
+from vllm.engine.async_llm_engine import AsyncLLMEngine
+from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.model_executor.models.registry import ModelRegistry
 
 # ---------------------------------------------------------------------------
@@ -81,7 +73,6 @@ logger = logging.getLogger("deepseek-ocr")
 # ---------------------------------------------------------------------------
 MODEL_PATH = os.environ.get("MODEL_PATH", "/workspace/models/DeepSeek-OCR")
 GPU_MEM_UTIL = float(os.environ.get("GPU_MEM_UTIL", "0.80"))
-MAX_CONCURRENT_INFERENCES = int(os.environ.get("MAX_CONCURRENT_INFERENCES", "4"))
 MAX_MODEL_LEN = int(os.environ.get("MAX_MODEL_LEN", "8192"))
 MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "8192"))
 HOST = os.environ.get("HOST", "0.0.0.0")
@@ -102,9 +93,9 @@ MAX_RETRIES = int(os.environ.get("MAX_RETRIES", str(DEFAULT_MAX_RETRIES)))
 TESSERACT_FALLBACK = os.environ.get("TESSERACT_FALLBACK", "true").lower() == "true"
 
 # Feedback storage
-FEEDBACK_DIR = os.environ.get("FEEDBACK_DIR", "/workspace/DeepSeek-OCR-1/feedback")
+FEEDBACK_DIR = os.environ.get("FEEDBACK_DIR", os.path.join(os.path.dirname(__file__), "feedback"))
 FEEDBACK_ENABLED = os.environ.get("FEEDBACK_ENABLED", "true").lower() == "true"
-FEEDBACK_SCORE_THRESHOLD = float(os.environ.get("FEEDBACK_SCORE_THRESHOLD", "0.70"))  # save failures only
+FEEDBACK_SCORE_THRESHOLD = float(os.environ.get("FEEDBACK_SCORE_THRESHOLD", "0.70"))
 
 # ---------------------------------------------------------------------------
 # Prompt templates
@@ -119,15 +110,11 @@ PROMPTS = {
 DEFAULT_PROMPT = "document"
 
 # ---------------------------------------------------------------------------
-# Global model instances (initialized in lifespan)
+# Global instances (initialized in lifespan)
 # ---------------------------------------------------------------------------
-llm: Optional[LLM] = None
+engine: Optional[AsyncLLMEngine] = None
 sampling_params: Optional[SamplingParams] = None
 processor: Optional[DeepseekOCRProcessor] = None
-thread_pool: Optional[ThreadPoolExecutor] = None
-
-# Semaphore prevents concurrent llm.generate() calls that would conflict on GPU
-_inference_semaphore: Optional[asyncio.Semaphore] = None
 
 
 # ---------------------------------------------------------------------------
@@ -202,80 +189,79 @@ def _preprocess_for_tesseract(image: Image.Image) -> Image.Image:
     """Adaptive thresholding to remove watermarks and normalize contrast."""
     gray = np.array(image.convert("L")).astype(float)
     background = ndimage.gaussian_filter(gray, sigma=25)
-    diff = background - gray
-    binary = np.where(diff > 15, 0, 255).astype(np.uint8)
-    return Image.fromarray(binary).convert("RGB")
+    normalized = gray - background + 128
+    normalized = np.clip(normalized, 0, 255).astype(np.uint8)
+    return Image.fromarray(normalized)
 
 
-def _run_tesseract_fallback(image: Image.Image) -> dict:
-    """Tesseract OCR fallback for pages DeepSeek-OCR cannot read."""
-    preprocessed = _preprocess_for_tesseract(image)
-    text = pytesseract.image_to_string(preprocessed, lang="eng")
-    text = text.strip()
+def _run_tesseract_fallback(image: Image.Image) -> Optional[dict]:
+    """Try Tesseract OCR as fallback. Returns result dict or None."""
+    try:
+        preprocessed = _preprocess_for_tesseract(image)
+        text = pytesseract.image_to_string(preprocessed, lang="eng")
+        text = text.strip()
 
-    if not text:
-        return None  # Tesseract also failed
+        if len(text) < 10:
+            return None
 
-    return {
-        "text": text,
-        "raw_text": text,
-        "num_tokens": 0,
-        "score": {
-            "composite": 0.50,
-            "variables": {
-                "self_consistency": 0.0,
-                "hallucination_ratio": 1.0,
-                "token_efficiency": 1.0,
-                "structural_integrity": 0.0,
-                "repetition_density": 1.0,
-                "content_density": 0.5,
+        return {
+            "text": text,
+            "raw_text": text,
+            "num_tokens": 0,
+            "score": {
+                "composite": 0.50,
+                "variables": {
+                    "self_consistency": 1.0,
+                    "hallucination_ratio": 1.0,
+                    "token_efficiency": 1.0,
+                    "structural_integrity": 0.0,
+                    "repetition_density": 1.0,
+                    "content_density": 0.0,
+                },
             },
-        },
-        "flag": "yellow",
-        "flag_message": "Extracted by Tesseract fallback — verify accuracy.",
-        "flag_details": [{
-            "code": "tesseract_fallback",
-            "severity": "warning",
-            "message": "Primary OCR failed. Text extracted by Tesseract fallback — may have lower accuracy.",
-        }],
-        "attempts": 0,
-        "preset": "tesseract_fallback",
-        "needs_external_ocr": False,
-        "ocr_engine": "tesseract",
-    }
+            "flag": "yellow",
+            "flag_message": f"Tesseract fallback — extracted {len(text)} chars. Verify accuracy.",
+            "flag_details": [{
+                "code": "tesseract_fallback",
+                "severity": "warning",
+                "message": "Text extracted by Tesseract fallback — accuracy may vary.",
+            }],
+            "attempts": 0,
+            "preset": None,
+            "needs_external_ocr": False,
+            "ocr_engine": "tesseract",
+        }
+    except Exception as e:
+        logger.warning("Tesseract fallback failed: %s", e)
+        return None
 
 
 def _save_feedback(image: Image.Image, result: dict, filename: str = None):
-    """Save low-scoring OCR result for future fine-tuning."""
+    """Save low-scoring OCR results for future fine-tuning."""
     if not FEEDBACK_ENABLED:
         return
-    score = result.get("score", {}).get("composite", 1.0)
-    if score >= FEEDBACK_SCORE_THRESHOLD and result.get("ocr_engine") != "tesseract":
-        return  # only save failures and tesseract fallbacks
 
-    import hashlib
-    from datetime import datetime
+    score = result.get("score", {}).get("composite", 1.0)
+    engine_used = result.get("ocr_engine", "deepseek")
+
+    # Save if score is below threshold or if Tesseract was used
+    if score >= FEEDBACK_SCORE_THRESHOLD and engine_used != "tesseract":
+        return
+
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    entry_id = f"{timestamp}_{uuid.uuid4().hex[:12]}"
 
     pending_dir = os.path.join(FEEDBACK_DIR, "pending")
     os.makedirs(pending_dir, exist_ok=True)
 
-    # Generate unique ID from image content
-    img_bytes = io.BytesIO()
-    image.save(img_bytes, format="PNG")
-    img_data = img_bytes.getvalue()
-    img_hash = hashlib.md5(img_data).hexdigest()[:12]
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    entry_id = f"{ts}_{img_hash}"
-
     # Save image
     img_path = os.path.join(pending_dir, f"{entry_id}.png")
-    with open(img_path, "wb") as f:
-        f.write(img_data)
+    image.save(img_path, format="PNG")
 
     # Save metadata
     meta = {
         "id": entry_id,
-        "timestamp": ts,
+        "timestamp": timestamp,
         "filename": filename,
         "ocr_engine": result.get("ocr_engine"),
         "score": result.get("score", {}).get("composite"),
@@ -329,17 +315,6 @@ def preprocess_image(image: Image.Image, prompt_key: str = DEFAULT_PROMPT) -> di
     }
 
 
-async def preprocess_images_batch(
-    images: list[Image.Image], prompt_key: str
-) -> list[dict]:
-    loop = asyncio.get_event_loop()
-    futures = [
-        loop.run_in_executor(thread_pool, preprocess_image, img, prompt_key)
-        for img in images
-    ]
-    return await asyncio.gather(*futures)
-
-
 def pdf_to_images(pdf_bytes: bytes, dpi: int = 144) -> list[Image.Image]:
     """Convert PDF bytes to a list of PIL Images."""
     images = []
@@ -364,35 +339,46 @@ def pdf_to_images(pdf_bytes: bytes, dpi: int = 144) -> list[Image.Image]:
     return images
 
 
-async def _run_inference(inputs: list[dict]) -> list:
-    """Run llm.generate() with semaphore protection."""
+async def _run_inference(image: Image.Image, prompt_key: str = DEFAULT_PROMPT) -> dict:
+    """Run inference via AsyncLLMEngine. Supports true concurrent requests."""
+    # Preprocess image synchronously (CPU work)
     loop = asyncio.get_event_loop()
+    vllm_input = await loop.run_in_executor(None, preprocess_image, image, prompt_key)
 
-    async with _inference_semaphore:
-        try:
-            outputs = await asyncio.wait_for(
-                loop.run_in_executor(
-                    None, llm.generate, inputs, sampling_params
-                ),
-                timeout=REQUEST_TIMEOUT_S,
-            )
-        except asyncio.TimeoutError:
-            raise HTTPException(
-                504, f"Inference timed out after {REQUEST_TIMEOUT_S}s"
-            )
-        except Exception as e:
-            logger.error("Inference failed: %s", e, exc_info=True)
-            raise HTTPException(500, f"Inference error: {e}")
+    # Generate a unique request ID
+    request_id = str(uuid.uuid4())
 
-    return outputs
+    # Submit to async engine — this returns an async generator
+    results_generator = engine.generate(
+        prompt=vllm_input,
+        sampling_params=sampling_params,
+        request_id=request_id,
+    )
+
+    # Collect the final output
+    final_output = None
+    try:
+        async for request_output in results_generator:
+            final_output = request_output
+    except Exception as e:
+        logger.error("Inference failed for request %s: %s", request_id, e, exc_info=True)
+        raise HTTPException(500, f"Inference error: {e}")
+
+    if final_output is None:
+        raise HTTPException(500, "Inference returned no output")
+
+    text = final_output.outputs[0].text
+    num_tokens = len(final_output.outputs[0].token_ids)
+
+    return {"text": text, "num_tokens": num_tokens}
 
 
-def _format_result(output, raw: bool) -> dict:
-    """Build a consistent result dict from a single vLLM output."""
-    text = output.outputs[0].text
+def _format_result(inference_output: dict, raw: bool) -> dict:
+    """Build a consistent result dict from inference output."""
+    text = inference_output["text"]
+    num_tokens = inference_output["num_tokens"]
     stats = CleanStats()
     cleaned = clean_output(text, stats=stats)
-    num_tokens = len(output.outputs[0].token_ids)
 
     # Score the result
     ocr_result = OCRResult(
@@ -434,7 +420,6 @@ def _format_result(output, raw: bool) -> dict:
 async def _run_inference_with_retry(
     image: Image.Image,
     prompt_key: str,
-    raw_image_data: Optional[bytes] = None,
 ) -> dict:
     """Run OCR with scoring and retry on low-quality results.
 
@@ -457,16 +442,12 @@ async def _run_inference_with_retry(
             )
         enhanced = enhanced.convert("RGB")
 
-        loop = asyncio.get_event_loop()
-        vllm_input = await loop.run_in_executor(
-            thread_pool, preprocess_image, enhanced, prompt_key
-        )
-        outputs = await _run_inference([vllm_input])
+        output = await _run_inference(enhanced, prompt_key)
 
-        text = outputs[0].outputs[0].text
+        text = output["text"]
+        num_tokens = output["num_tokens"]
         retry_stats = CleanStats()
         cleaned = clean_output(text, stats=retry_stats)
-        num_tokens = len(outputs[0].outputs[0].token_ids)
 
         ocr_result = OCRResult(
             raw_text=text,
@@ -541,24 +522,24 @@ def _check_file_size(data: bytes, max_mb: int, label: str = "File"):
 
 
 # ---------------------------------------------------------------------------
-# Lifespan (replaces deprecated @app.on_event)
+# Lifespan
 # ---------------------------------------------------------------------------
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Startup: load model.  Shutdown: release resources."""
-    global llm, sampling_params, processor, thread_pool, _inference_semaphore
+    """Startup: load AsyncLLMEngine.  Shutdown: release resources."""
+    global engine, sampling_params, processor
 
     # ---- Startup ----
     logger.info("Loading model from %s …", MODEL_PATH)
     ModelRegistry.register_model("DeepseekOCRForCausalLM", DeepseekOCRForCausalLM)
 
-    llm = LLM(
+    engine_args = AsyncEngineArgs(
         model=MODEL_PATH,
         task="generate",
         hf_overrides={"architectures": ["DeepseekOCRForCausalLM"]},
-        block_size=256,
+        block_size=128,
         enforce_eager=False,
         trust_remote_code=True,
         max_model_len=MAX_MODEL_LEN,
@@ -568,6 +549,8 @@ async def lifespan(app: FastAPI):
         gpu_memory_utilization=GPU_MEM_UTIL,
         disable_mm_preprocessor_cache=True,
     )
+
+    engine = AsyncLLMEngine.from_engine_args(engine_args)
 
     logits_processors = [
         NoRepeatNGramLogitsProcessor(
@@ -586,19 +569,15 @@ async def lifespan(app: FastAPI):
     )
 
     processor = DeepseekOCRProcessor()
-    thread_pool = ThreadPoolExecutor(max_workers=NUM_WORKERS)
 
-    _inference_semaphore = asyncio.Semaphore(MAX_CONCURRENT_INFERENCES)
-
-    logger.info("Model loaded and ready.")
+    logger.info("Model loaded and ready (async engine).")
 
     yield  # ---- App runs here ----
 
     # ---- Shutdown ----
     logger.info("Shutting down …")
-    if thread_pool:
-        thread_pool.shutdown(wait=False)
-    del llm
+    if engine:
+        engine.shutdown_background_loop()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     logger.info("Cleanup complete.")
@@ -607,7 +586,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="DeepSeek-OCR API",
     description="Production OCR API powered by DeepSeek-OCR",
-    version="3.0.0",
+    version="4.0.0",
     lifespan=lifespan,
 )
 
@@ -625,7 +604,7 @@ async def root():
 @app.get("/health")
 async def health():
     return {
-        "status": "healthy" if llm is not None else "loading",
+        "status": "healthy" if engine is not None else "loading",
         "model": MODEL_PATH,
         "gpu": (
             torch.cuda.get_device_name(0) if torch.cuda.is_available() else "none"
@@ -684,13 +663,9 @@ async def ocr_image(
         _save_feedback(image, result, filename=file.filename)
         return JSONResponse(result)
     else:
-        image = enhance_scan(image).convert("RGB")
-        loop = asyncio.get_event_loop()
-        vllm_input = await loop.run_in_executor(
-            thread_pool, preprocess_image, image, prompt
-        )
-        outputs = await _run_inference([vllm_input])
-        result = _format_result(outputs[0], raw)
+        enhanced = enhance_scan(image).convert("RGB")
+        output = await _run_inference(enhanced, prompt)
+        result = _format_result(output, raw)
         _save_feedback(image, result, filename=file.filename)
         return JSONResponse(result)
 
@@ -738,13 +713,9 @@ async def ocr_image_base64(
         _save_feedback(image, result)
         return JSONResponse(result)
     else:
-        image = enhance_scan(image).convert("RGB")
-        loop = asyncio.get_event_loop()
-        vllm_input = await loop.run_in_executor(
-            thread_pool, preprocess_image, image, prompt
-        )
-        outputs = await _run_inference([vllm_input])
-        result = _format_result(outputs[0], raw)
+        enhanced = enhance_scan(image).convert("RGB")
+        output = await _run_inference(enhanced, prompt)
+        result = _format_result(output, raw)
         _save_feedback(image, result)
         return JSONResponse(result)
 
@@ -772,7 +743,7 @@ async def ocr_pdf(
     _check_file_size(pdf_bytes, MAX_PDF_SIZE_MB, "PDF")
 
     loop = asyncio.get_event_loop()
-    images = await loop.run_in_executor(thread_pool, pdf_to_images, pdf_bytes, dpi)
+    images = await loop.run_in_executor(None, pdf_to_images, pdf_bytes, dpi)
 
     if not images:
         raise HTTPException(400, "Could not extract any pages from the PDF")
@@ -805,23 +776,28 @@ async def ocr_pdf(
             result["page"] = i + 1
             pages[i] = result
 
-    # Run OCR on processable pages
-    processable_images = [img for img, skip in zip(images, skip_flags) if skip is None]
-    if processable_images:
-        batch_inputs = await preprocess_images_batch(processable_images, prompt)
-        outputs = await _run_inference(batch_inputs)
+    # Run OCR on processable pages concurrently
+    processable_indices = [i for i, skip in enumerate(skip_flags) if skip is None]
+    if processable_indices:
+        async def _ocr_page(page_idx: int) -> tuple[int, dict]:
+            output = await _run_inference(images[page_idx], prompt)
+            result = _format_result(output, raw)
+            result["page"] = page_idx + 1
+            return page_idx, result
 
-        proc_idx = 0
-        for i, skip in enumerate(skip_flags):
-            if skip is None:
-                result = _format_result(outputs[proc_idx], raw)
-                result["page"] = i + 1
-                pages[i] = result
-                proc_idx += 1
+        ocr_tasks = [_ocr_page(i) for i in processable_indices]
+        ocr_results = await asyncio.gather(*ocr_tasks, return_exceptions=True)
+
+        for item in ocr_results:
+            if isinstance(item, Exception):
+                logger.error("Page OCR failed: %s", item)
+                continue
+            page_idx, result = item
+            pages[page_idx] = result
 
     retry_indices = []
     for i, result in enumerate(pages):
-        if skip_flags[i] is None and retry and result["score"]["composite"] < SCORE_THRESHOLD:
+        if result is not None and skip_flags[i] is None and retry and result["score"]["composite"] < SCORE_THRESHOLD:
             retry_indices.append(i)
 
     # Retry low-scoring pages individually with different presets
@@ -844,6 +820,12 @@ async def ocr_pdf(
         # Use retry result if it scored better
         if retry_result.get("score", {}).get("composite", 0) > pages[idx]["score"]["composite"]:
             pages[idx] = retry_result
+
+    # Fill any None pages (from failed OCR)
+    for i, p in enumerate(pages):
+        if p is None:
+            pages[i] = _skip_page_result("OCR failed", "ocr_failed")
+            pages[i]["page"] = i + 1
 
     full_text = "\n\n---\n\n".join(p["text"] for p in pages)
 
@@ -953,15 +935,24 @@ async def ocr_batch(
             processable_valid.append((j, original_idx))
 
     if processable_enhanced:
-        batch_inputs = await preprocess_images_batch(processable_enhanced, prompt)
-        outputs = await _run_inference(batch_inputs)
-
-        retry_queue = []  # (result_list_index, raw_image_index, original_file_index)
-        for k, output in enumerate(outputs):
+        async def _ocr_batch_item(k: int) -> tuple[int, dict]:
             j, original_idx = processable_valid[k]
+            output = await _run_inference(processable_enhanced[k], prompt)
             result = _format_result(output, raw)
             result["index"] = original_idx
             result["filename"] = files[original_idx].filename
+            return k, result
+
+        ocr_tasks = [_ocr_batch_item(k) for k in range(len(processable_enhanced))]
+        ocr_results = await asyncio.gather(*ocr_tasks, return_exceptions=True)
+
+        retry_queue = []  # (result_list_index, raw_image_index, original_file_index)
+        for item in ocr_results:
+            if isinstance(item, Exception):
+                logger.error("Batch item OCR failed: %s", item)
+                continue
+            k, result = item
+            j, original_idx = processable_valid[k]
             result_pos = len(results)
             results.append(result)
 
@@ -1143,7 +1134,7 @@ async def feedback_pending():
 
 
 # ---------------------------------------------------------------------------
-# Main — workers is always 1 to avoid duplicating the model in GPU memory
+# Main
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
