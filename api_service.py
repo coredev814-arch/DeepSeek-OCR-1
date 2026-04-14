@@ -27,7 +27,10 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from typing import Optional
 
+import numpy as np
+import pytesseract
 import torch
+from scipy import ndimage
 
 os.environ["VLLM_USE_V1"] = "0"
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
@@ -77,7 +80,8 @@ logger = logging.getLogger("deepseek-ocr")
 # Configuration
 # ---------------------------------------------------------------------------
 MODEL_PATH = os.environ.get("MODEL_PATH", "/workspace/models/DeepSeek-OCR")
-GPU_MEM_UTIL = float(os.environ.get("GPU_MEM_UTIL", "0.75"))
+GPU_MEM_UTIL = float(os.environ.get("GPU_MEM_UTIL", "0.80"))
+MAX_CONCURRENT_INFERENCES = int(os.environ.get("MAX_CONCURRENT_INFERENCES", "4"))
 MAX_MODEL_LEN = int(os.environ.get("MAX_MODEL_LEN", "8192"))
 MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "8192"))
 HOST = os.environ.get("HOST", "0.0.0.0")
@@ -93,6 +97,14 @@ REQUEST_TIMEOUT_S = int(os.environ.get("REQUEST_TIMEOUT_S", "120"))
 # Scoring / retry
 SCORE_THRESHOLD = float(os.environ.get("SCORE_THRESHOLD", str(DEFAULT_THRESHOLD)))
 MAX_RETRIES = int(os.environ.get("MAX_RETRIES", str(DEFAULT_MAX_RETRIES)))
+
+# Tesseract fallback
+TESSERACT_FALLBACK = os.environ.get("TESSERACT_FALLBACK", "true").lower() == "true"
+
+# Feedback storage
+FEEDBACK_DIR = os.environ.get("FEEDBACK_DIR", "/workspace/DeepSeek-OCR-1/feedback")
+FEEDBACK_ENABLED = os.environ.get("FEEDBACK_ENABLED", "true").lower() == "true"
+FEEDBACK_SCORE_THRESHOLD = float(os.environ.get("FEEDBACK_SCORE_THRESHOLD", "0.70"))  # save failures only
 
 # ---------------------------------------------------------------------------
 # Prompt templates
@@ -121,6 +133,165 @@ _inference_semaphore: Optional[asyncio.Semaphore] = None
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def is_blank_page(image: Image.Image, std_threshold: float = 5.0, dark_threshold: float = 0.02) -> bool:
+    """Fast pixel-based blank page detection. Returns True if the image is blank."""
+    gray = np.array(image.convert("L"))
+    if gray.std() >= std_threshold:
+        return False
+    dark_ratio = (gray < 240).sum() / gray.size
+    return dark_ratio < dark_threshold
+
+
+def is_low_quality_scan(image: Image.Image, content_area_threshold: float = 0.12) -> bool:
+    """Detect scans where content is shrunk to a tiny area, making text unreadable.
+
+    Checks the ratio of the content bounding box to the full page area.
+    Returns True if content occupies less than ``content_area_threshold`` of the page.
+    """
+    gray = np.array(image.convert("L"))
+    h, w = gray.shape
+
+    # Find rows/cols with meaningful dark pixels
+    row_dark = (gray < 200).sum(axis=1)
+    col_dark = (gray < 200).sum(axis=0)
+    row_thresh = w * 0.01
+    col_thresh = h * 0.01
+    content_rows = np.where(row_dark > row_thresh)[0]
+    content_cols = np.where(col_dark > col_thresh)[0]
+
+    if len(content_rows) == 0 or len(content_cols) == 0:
+        return True  # no content at all
+
+    content_h = content_rows[-1] - content_rows[0]
+    content_w = content_cols[-1] - content_cols[0]
+    content_area_ratio = (content_h * content_w) / (h * w)
+
+    return content_area_ratio < content_area_threshold
+
+
+def _skip_page_result(reason: str, flag_detail: str) -> dict:
+    """Return a pre-built result dict for a skipped page (no OCR needed)."""
+    return {
+        "text": "",
+        "raw_text": "",
+        "num_tokens": 0,
+        "score": {
+            "composite": 0.0,
+            "variables": {
+                "self_consistency": 0.0,
+                "hallucination_ratio": 0.0,
+                "token_efficiency": 0.0,
+                "structural_integrity": 0.0,
+                "repetition_density": 0.0,
+                "content_density": 0.0,
+            },
+        },
+        "flag": "red",
+        "flag_message": reason,
+        "flag_details": [flag_detail],
+        "attempts": 0,
+        "preset": None,
+        "needs_external_ocr": False,
+        "ocr_engine": "skipped",
+    }
+
+
+def _preprocess_for_tesseract(image: Image.Image) -> Image.Image:
+    """Adaptive thresholding to remove watermarks and normalize contrast."""
+    gray = np.array(image.convert("L")).astype(float)
+    background = ndimage.gaussian_filter(gray, sigma=25)
+    diff = background - gray
+    binary = np.where(diff > 15, 0, 255).astype(np.uint8)
+    return Image.fromarray(binary).convert("RGB")
+
+
+def _run_tesseract_fallback(image: Image.Image) -> dict:
+    """Tesseract OCR fallback for pages DeepSeek-OCR cannot read."""
+    preprocessed = _preprocess_for_tesseract(image)
+    text = pytesseract.image_to_string(preprocessed, lang="eng")
+    text = text.strip()
+
+    if not text:
+        return None  # Tesseract also failed
+
+    return {
+        "text": text,
+        "raw_text": text,
+        "num_tokens": 0,
+        "score": {
+            "composite": 0.50,
+            "variables": {
+                "self_consistency": 0.0,
+                "hallucination_ratio": 1.0,
+                "token_efficiency": 1.0,
+                "structural_integrity": 0.0,
+                "repetition_density": 1.0,
+                "content_density": 0.5,
+            },
+        },
+        "flag": "yellow",
+        "flag_message": "Extracted by Tesseract fallback — verify accuracy.",
+        "flag_details": [{
+            "code": "tesseract_fallback",
+            "severity": "warning",
+            "message": "Primary OCR failed. Text extracted by Tesseract fallback — may have lower accuracy.",
+        }],
+        "attempts": 0,
+        "preset": "tesseract_fallback",
+        "needs_external_ocr": False,
+        "ocr_engine": "tesseract",
+    }
+
+
+def _save_feedback(image: Image.Image, result: dict, filename: str = None):
+    """Save low-scoring OCR result for future fine-tuning."""
+    if not FEEDBACK_ENABLED:
+        return
+    score = result.get("score", {}).get("composite", 1.0)
+    if score >= FEEDBACK_SCORE_THRESHOLD and result.get("ocr_engine") != "tesseract":
+        return  # only save failures and tesseract fallbacks
+
+    import hashlib
+    from datetime import datetime
+
+    pending_dir = os.path.join(FEEDBACK_DIR, "pending")
+    os.makedirs(pending_dir, exist_ok=True)
+
+    # Generate unique ID from image content
+    img_bytes = io.BytesIO()
+    image.save(img_bytes, format="PNG")
+    img_data = img_bytes.getvalue()
+    img_hash = hashlib.md5(img_data).hexdigest()[:12]
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    entry_id = f"{ts}_{img_hash}"
+
+    # Save image
+    img_path = os.path.join(pending_dir, f"{entry_id}.png")
+    with open(img_path, "wb") as f:
+        f.write(img_data)
+
+    # Save metadata
+    meta = {
+        "id": entry_id,
+        "timestamp": ts,
+        "filename": filename,
+        "ocr_engine": result.get("ocr_engine"),
+        "score": result.get("score", {}).get("composite"),
+        "flag": result.get("flag"),
+        "text": result.get("text", ""),
+        "raw_text": result.get("raw_text", ""),
+        "attempts": result.get("attempts", 0),
+        "corrected_text": None,  # filled by /feedback/correct
+        "status": "pending",
+    }
+    meta_path = os.path.join(pending_dir, f"{entry_id}.json")
+    import json as _json
+    with open(meta_path, "w") as f:
+        _json.dump(meta, f, indent=2)
+
+    logger.info("Feedback saved: %s (score=%.3f, engine=%s)", entry_id, score, result.get("ocr_engine"))
 
 
 def _validate_prompt(prompt: str) -> str:
@@ -234,7 +405,7 @@ def _format_result(output, raw: bool) -> dict:
     score = score_result(ocr_result)
     flag_info = compute_flags(ocr_result, SCORE_THRESHOLD)
 
-    return {
+    result = {
         "text": text if raw else cleaned,
         "raw_text": text,
         "num_tokens": num_tokens,
@@ -242,7 +413,22 @@ def _format_result(output, raw: bool) -> dict:
         "flag": flag_info["flag"],
         "flag_message": flag_info["message"],
         "flag_details": flag_info["details"],
+        "needs_external_ocr": False,
+        "ocr_engine": "deepseek",
     }
+
+    # Flag OCR extraction failure: page has content but model couldn't read it
+    clean_len = len(cleaned.strip())
+    if clean_len <= 10 and score.composite < SCORE_THRESHOLD:
+        result["needs_external_ocr"] = True
+        if not any(d.get("code") == "ocr_failed" for d in result["flag_details"]):
+            result["flag_details"].append({
+                "code": "ocr_failed",
+                "severity": "critical",
+                "message": "OCR extraction failed — page has content but model could not read it. Route to external OCR.",
+            })
+
+    return result
 
 
 async def _run_inference_with_retry(
@@ -308,7 +494,7 @@ async def _run_inference_with_retry(
     best = select_best_result(results)
     flag_info = compute_flags(best, SCORE_THRESHOLD)
 
-    return {
+    result = {
         "text": best.clean_text,
         "raw_text": best.raw_text,
         "num_tokens": best.num_tokens,
@@ -318,7 +504,32 @@ async def _run_inference_with_retry(
         "flag_details": flag_info["details"],
         "attempts": len(results),
         "preset": best.preset_name,
+        "needs_external_ocr": False,
+        "ocr_engine": "deepseek",
     }
+
+    # Flag OCR extraction failure: page has content but model couldn't read it
+    clean_len = len(best.clean_text.strip())
+    composite = best.score.composite if best.score else 0
+    if clean_len <= 10 and composite < SCORE_THRESHOLD:
+        # Try Tesseract fallback before giving up
+        if TESSERACT_FALLBACK:
+            logger.info("DeepSeek-OCR failed — trying Tesseract fallback")
+            fallback = _run_tesseract_fallback(image)
+            if fallback:
+                logger.info("Tesseract fallback extracted %d chars", len(fallback["text"]))
+                fallback["attempts"] = len(results)
+                return fallback
+
+        result["needs_external_ocr"] = True
+        if not any(d.get("code") == "ocr_failed" for d in result["flag_details"]):
+            result["flag_details"].append({
+                "code": "ocr_failed",
+                "severity": "critical",
+                "message": "OCR extraction failed — page has content but model could not read it. Route to external OCR.",
+            })
+
+    return result
 
 
 def _check_file_size(data: bytes, max_mb: int, label: str = "File"):
@@ -377,7 +588,7 @@ async def lifespan(app: FastAPI):
     processor = DeepseekOCRProcessor()
     thread_pool = ThreadPoolExecutor(max_workers=NUM_WORKERS)
 
-    _inference_semaphore = asyncio.Semaphore(1)
+    _inference_semaphore = asyncio.Semaphore(MAX_CONCURRENT_INFERENCES)
 
     logger.info("Model loaded and ready.")
 
@@ -456,10 +667,21 @@ async def ocr_image(
     except Exception:
         pass
 
+    # Skip blank pages entirely
+    if is_blank_page(image):
+        logger.info("Blank page detected — skipping OCR")
+        return JSONResponse(_skip_page_result("Blank page detected — skipped OCR", "blank_page"))
+
+    # Skip low-quality scans where content is too small to read
+    if is_low_quality_scan(image):
+        logger.info("Low-quality scan detected — skipping OCR")
+        return JSONResponse(_skip_page_result("Low-quality scan — content too small to read", "low_quality_scan"))
+
     if retry:
         result = await _run_inference_with_retry(image, prompt)
         if raw:
             result["text"] = result["raw_text"]
+        _save_feedback(image, result, filename=file.filename)
         return JSONResponse(result)
     else:
         image = enhance_scan(image).convert("RGB")
@@ -468,7 +690,9 @@ async def ocr_image(
             thread_pool, preprocess_image, image, prompt
         )
         outputs = await _run_inference([vllm_input])
-        return JSONResponse(_format_result(outputs[0], raw))
+        result = _format_result(outputs[0], raw)
+        _save_feedback(image, result, filename=file.filename)
+        return JSONResponse(result)
 
 
 @app.post("/ocr/image/base64")
@@ -497,10 +721,21 @@ async def ocr_image_base64(
     except Exception:
         pass
 
+    # Skip blank pages entirely
+    if is_blank_page(image):
+        logger.info("Blank page detected — skipping OCR")
+        return JSONResponse(_skip_page_result("Blank page detected — skipped OCR", "blank_page"))
+
+    # Skip low-quality scans where content is too small to read
+    if is_low_quality_scan(image):
+        logger.info("Low-quality scan detected — skipping OCR")
+        return JSONResponse(_skip_page_result("Low-quality scan — content too small to read", "low_quality_scan"))
+
     if retry:
         result = await _run_inference_with_retry(image, prompt)
         if raw:
             result["text"] = result["raw_text"]
+        _save_feedback(image, result)
         return JSONResponse(result)
     else:
         image = enhance_scan(image).convert("RGB")
@@ -509,7 +744,9 @@ async def ocr_image_base64(
             thread_pool, preprocess_image, image, prompt
         )
         outputs = await _run_inference([vllm_input])
-        return JSONResponse(_format_result(outputs[0], raw))
+        result = _format_result(outputs[0], raw)
+        _save_feedback(image, result)
+        return JSONResponse(result)
 
 
 @app.post("/ocr/pdf")
@@ -540,19 +777,51 @@ async def ocr_pdf(
     if not images:
         raise HTTPException(400, "Could not extract any pages from the PDF")
 
-    # First pass: batch all pages
-    batch_inputs = await preprocess_images_batch(images, prompt)
-    outputs = await _run_inference(batch_inputs)
+    # Detect blank and low-quality pages before OCR
+    skip_flags = []  # None = process, str = reason to skip
+    for img in images:
+        if is_blank_page(img):
+            skip_flags.append("blank_page")
+        elif is_low_quality_scan(img):
+            skip_flags.append("low_quality_scan")
+        else:
+            skip_flags.append(None)
 
-    pages = []
+    skip_count = sum(1 for s in skip_flags if s is not None)
+    if skip_count:
+        logger.info("Skipping %d page(s) (blank or low-quality) — no OCR needed", skip_count)
+
+    # First pass: batch processable pages only
+    pages = [None] * len(images)
+
+    # Fill in skipped pages immediately
+    skip_messages = {
+        "blank_page": "Blank page detected — skipped OCR",
+        "low_quality_scan": "Low-quality scan — content too small to read",
+    }
+    for i, skip in enumerate(skip_flags):
+        if skip:
+            result = _skip_page_result(skip_messages[skip], skip)
+            result["page"] = i + 1
+            pages[i] = result
+
+    # Run OCR on processable pages
+    processable_images = [img for img, skip in zip(images, skip_flags) if skip is None]
+    if processable_images:
+        batch_inputs = await preprocess_images_batch(processable_images, prompt)
+        outputs = await _run_inference(batch_inputs)
+
+        proc_idx = 0
+        for i, skip in enumerate(skip_flags):
+            if skip is None:
+                result = _format_result(outputs[proc_idx], raw)
+                result["page"] = i + 1
+                pages[i] = result
+                proc_idx += 1
+
     retry_indices = []
-
-    for i, output in enumerate(outputs):
-        result = _format_result(output, raw)
-        result["page"] = i + 1
-        pages.append(result)
-
-        if retry and result["score"]["composite"] < SCORE_THRESHOLD:
+    for i, result in enumerate(pages):
+        if skip_flags[i] is None and retry and result["score"]["composite"] < SCORE_THRESHOLD:
             retry_indices.append(i)
 
     # Retry low-scoring pages individually with different presets
@@ -655,28 +924,56 @@ async def ocr_batch(
 
     results: list[dict] = []
 
-    if enhanced_images:
-        batch_inputs = await preprocess_images_batch(enhanced_images, prompt)
-        outputs = await _run_inference(batch_inputs)
+    # Separate skippable pages (blank or low-quality) before OCR
+    skip_messages = {
+        "blank_page": "Blank page detected — skipped OCR",
+        "low_quality_scan": "Low-quality scan — content too small to read",
+    }
+    processable_raw = []
+    processable_enhanced = []
+    processable_valid = []
+    for j, (img_raw, img_enh) in enumerate(zip(raw_images, enhanced_images)):
+        original_idx = valid_indices[j]
+        if is_blank_page(img_raw):
+            skip_type = "blank_page"
+        elif is_low_quality_scan(img_raw):
+            skip_type = "low_quality_scan"
+        else:
+            skip_type = None
 
-        retry_indices = []
-        for j, output in enumerate(outputs):
-            original_idx = valid_indices[j]
-            result = _format_result(output, raw)
+        if skip_type:
+            logger.info("%s — skipping OCR for %s", skip_messages[skip_type], files[original_idx].filename)
+            result = _skip_page_result(skip_messages[skip_type], skip_type)
             result["index"] = original_idx
             result["filename"] = files[original_idx].filename
             results.append(result)
+        else:
+            processable_raw.append(img_raw)
+            processable_enhanced.append(img_enh)
+            processable_valid.append((j, original_idx))
+
+    if processable_enhanced:
+        batch_inputs = await preprocess_images_batch(processable_enhanced, prompt)
+        outputs = await _run_inference(batch_inputs)
+
+        retry_queue = []  # (result_list_index, raw_image_index, original_file_index)
+        for k, output in enumerate(outputs):
+            j, original_idx = processable_valid[k]
+            result = _format_result(output, raw)
+            result["index"] = original_idx
+            result["filename"] = files[original_idx].filename
+            result_pos = len(results)
+            results.append(result)
 
             if retry and result["score"]["composite"] < SCORE_THRESHOLD:
-                retry_indices.append(j)
+                retry_queue.append((result_pos, j, original_idx))
 
         # Retry low-scoring images
-        for j in retry_indices:
-            original_idx = valid_indices[j]
+        for result_pos, j, original_idx in retry_queue:
             logger.info(
                 "Retrying %s (score=%.3f)",
                 files[original_idx].filename,
-                results[j]["score"]["composite"],
+                results[result_pos]["score"]["composite"],
             )
             retry_result = await _run_inference_with_retry(
                 raw_images[j], prompt
@@ -686,8 +983,8 @@ async def ocr_batch(
             retry_result["index"] = original_idx
             retry_result["filename"] = files[original_idx].filename
 
-            if retry_result.get("score", {}).get("composite", 0) > results[j]["score"]["composite"]:
-                results[j] = retry_result
+            if retry_result.get("score", {}).get("composite", 0) > results[result_pos]["score"]["composite"]:
+                results[result_pos] = retry_result
 
     # Build summary by flag color
     summary = {"green": 0, "yellow": 0, "red": 0}
@@ -715,6 +1012,134 @@ async def ocr_batch(
             "flagged_results": flagged_results,
         }
     )
+
+
+# ---------------------------------------------------------------------------
+# Feedback endpoints
+# ---------------------------------------------------------------------------
+
+
+@app.post("/feedback/correct")
+async def feedback_correct(
+    entry_id: str = Form(...),
+    corrected_text: str = Form(...),
+):
+    """Submit corrected text for a previously saved feedback entry.
+
+    The downstream AI or human reviewer sends the correct text for a page
+    that scored below threshold. These verified pairs are used for fine-tuning.
+    """
+    import json as _json
+
+    pending_dir = os.path.join(FEEDBACK_DIR, "pending")
+    verified_dir = os.path.join(FEEDBACK_DIR, "verified")
+    os.makedirs(verified_dir, exist_ok=True)
+
+    meta_path = os.path.join(pending_dir, f"{entry_id}.json")
+    img_path = os.path.join(pending_dir, f"{entry_id}.png")
+
+    if not os.path.exists(meta_path):
+        raise HTTPException(404, f"Feedback entry '{entry_id}' not found")
+
+    with open(meta_path) as f:
+        meta = _json.load(f)
+
+    meta["corrected_text"] = corrected_text
+    meta["status"] = "verified"
+
+    # Move to verified directory
+    verified_meta = os.path.join(verified_dir, f"{entry_id}.json")
+    verified_img = os.path.join(verified_dir, f"{entry_id}.png")
+
+    with open(verified_meta, "w") as f:
+        _json.dump(meta, f, indent=2)
+
+    if os.path.exists(img_path):
+        os.rename(img_path, verified_img)
+    os.remove(meta_path)
+
+    logger.info("Feedback verified: %s (%d chars corrected text)", entry_id, len(corrected_text))
+
+    return JSONResponse({
+        "status": "verified",
+        "entry_id": entry_id,
+        "corrected_length": len(corrected_text),
+    })
+
+
+@app.get("/feedback/stats")
+async def feedback_stats():
+    """Show feedback storage statistics."""
+    import json as _json
+
+    pending_dir = os.path.join(FEEDBACK_DIR, "pending")
+    verified_dir = os.path.join(FEEDBACK_DIR, "verified")
+
+    pending = 0
+    verified = 0
+    engines = {}
+
+    for d, status in [(pending_dir, "pending"), (verified_dir, "verified")]:
+        if not os.path.isdir(d):
+            continue
+        for f in os.listdir(d):
+            if not f.endswith(".json"):
+                continue
+            if status == "pending":
+                pending += 1
+            else:
+                verified += 1
+            try:
+                with open(os.path.join(d, f)) as fp:
+                    meta = _json.load(fp)
+                eng = meta.get("ocr_engine", "unknown")
+                engines[eng] = engines.get(eng, 0) + 1
+            except Exception:
+                pass
+
+    # Estimate disk usage
+    total_bytes = 0
+    for d in [pending_dir, verified_dir]:
+        if os.path.isdir(d):
+            for f in os.listdir(d):
+                total_bytes += os.path.getsize(os.path.join(d, f))
+
+    return JSONResponse({
+        "pending": pending,
+        "verified": verified,
+        "total": pending + verified,
+        "ready_for_training": verified >= 50,
+        "engines": engines,
+        "disk_usage_mb": round(total_bytes / (1024 * 1024), 2),
+    })
+
+
+@app.get("/feedback/pending")
+async def feedback_pending():
+    """List pending feedback entries awaiting correction."""
+    import json as _json
+
+    pending_dir = os.path.join(FEEDBACK_DIR, "pending")
+    if not os.path.isdir(pending_dir):
+        return JSONResponse({"entries": []})
+
+    entries = []
+    for f in sorted(os.listdir(pending_dir)):
+        if not f.endswith(".json"):
+            continue
+        with open(os.path.join(pending_dir, f)) as fp:
+            meta = _json.load(fp)
+        entries.append({
+            "entry_id": meta["id"],
+            "timestamp": meta["timestamp"],
+            "filename": meta.get("filename"),
+            "score": meta.get("score"),
+            "flag": meta.get("flag"),
+            "ocr_engine": meta.get("ocr_engine"),
+            "text_length": len(meta.get("text", "")),
+        })
+
+    return JSONResponse({"entries": entries, "total": len(entries)})
 
 
 # ---------------------------------------------------------------------------

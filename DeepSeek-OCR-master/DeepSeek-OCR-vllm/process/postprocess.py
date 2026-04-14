@@ -393,12 +393,8 @@ def clean_output(text: str, stats: CleanStats | None = None) -> str:
     """
     text = text.replace("<\uff5cend\u2581of\u2581sentence\uff5c>", "")
 
-    # Remove grounding refs (non-image)
-    pattern = r"(<\|ref\|>(.*?)<\|/ref\|><\|det\|>(.*?)<\|/det\|>)"
-    matches = re.findall(pattern, text, re.DOTALL)
-    for match in matches:
-        if "<|ref|>image<|/ref|>" not in match[0]:
-            text = text.replace(match[0], "")
+    # Remove all grounding refs (including image refs — they are not useful text)
+    text = re.sub(r"<\|ref\|>.*?<\|/ref\|><\|det\|>.*?<\|/det\|>", "", text, flags=re.DOTALL)
 
     text = text.replace("\\coloneqq", ":=").replace("\\eqqcolon", "=:")
     text = _collapse_empty_table_cells(text)
