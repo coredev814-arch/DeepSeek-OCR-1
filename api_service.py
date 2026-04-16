@@ -405,6 +405,7 @@ def _format_result(inference_output: dict, raw: bool) -> dict:
 
     # Flag OCR extraction failure: page has content but model couldn't read it
     clean_len = len(cleaned.strip())
+    raw_len = len(text.strip())
     if clean_len <= 10 and score.composite < SCORE_THRESHOLD:
         result["needs_external_ocr"] = True
         if not any(d.get("code") == "ocr_failed" for d in result["flag_details"]):
@@ -413,6 +414,21 @@ def _format_result(inference_output: dict, raw: bool) -> dict:
                 "severity": "critical",
                 "message": "OCR extraction failed — page has content but model could not read it. Route to external OCR.",
             })
+
+    # Flag incomplete extraction: model hit max tokens and most output was hallucinated
+    if (
+        not result["needs_external_ocr"]
+        and num_tokens >= MAX_TOKENS * 0.85
+        and raw_len > 0
+        and clean_len / raw_len < 0.10
+        and score.composite < SCORE_THRESHOLD
+    ):
+        result["needs_external_ocr"] = True
+        result["flag_details"].append({
+            "code": "incomplete_extraction",
+            "severity": "critical",
+            "message": f"Model hit token limit with {clean_len}/{raw_len} chars retained ({clean_len/raw_len*100:.0f}%). Most output was hallucinated. Route to external OCR.",
+        })
 
     return result
 
@@ -491,6 +507,7 @@ async def _run_inference_with_retry(
 
     # Flag OCR extraction failure: page has content but model couldn't read it
     clean_len = len(best.clean_text.strip())
+    raw_len = len(best.raw_text.strip())
     composite = best.score.composite if best.score else 0
     if clean_len <= 10 and composite < SCORE_THRESHOLD:
         # Try Tesseract fallback before giving up
@@ -509,6 +526,21 @@ async def _run_inference_with_retry(
                 "severity": "critical",
                 "message": "OCR extraction failed — page has content but model could not read it. Route to external OCR.",
             })
+
+    # Flag incomplete extraction: model hit max tokens and most output was hallucinated
+    if (
+        not result["needs_external_ocr"]
+        and best.num_tokens >= MAX_TOKENS * 0.85
+        and raw_len > 0
+        and clean_len / raw_len < 0.10
+        and composite < SCORE_THRESHOLD
+    ):
+        result["needs_external_ocr"] = True
+        result["flag_details"].append({
+            "code": "incomplete_extraction",
+            "severity": "critical",
+            "message": f"Model hit token limit with {clean_len}/{raw_len} chars retained ({clean_len/raw_len*100:.0f}%). Most output was hallucinated. Route to external OCR.",
+        })
 
     return result
 
