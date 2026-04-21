@@ -91,7 +91,7 @@ MAX_RETRIES = int(os.environ.get("MAX_RETRIES", str(DEFAULT_MAX_RETRIES)))
 # GLM-OCR fallback (remote service on separate machine)
 GLM_OCR_ENABLED = os.environ.get("GLM_OCR_ENABLED", "true").lower() == "true"
 GLM_OCR_URL = os.environ.get("GLM_OCR_URL", "https://rcdl6csypms0q9-8889.proxy.runpod.net/ocr/parse")
-GLM_OCR_TIMEOUT = int(os.environ.get("GLM_OCR_TIMEOUT", "120"))
+GLM_OCR_TIMEOUT = int(os.environ.get("GLM_OCR_TIMEOUT", "300"))
 
 # Feedback storage
 FEEDBACK_DIR = os.environ.get("FEEDBACK_DIR", os.path.join(os.path.dirname(__file__), "feedback"))
