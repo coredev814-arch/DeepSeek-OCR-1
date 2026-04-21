@@ -1,8 +1,6 @@
 """Test all images in the images/ folder against the OCR service."""
 
-import json
 import os
-import sys
 import time
 import requests
 
@@ -18,8 +16,9 @@ def main():
     print(f"{'Page':<12} {'Engine':<12} {'Flag':<8} {'Score':>6} {'Chars':>7} {'Tokens':>7} {'ExtOCR':>6} {'Time':>6}  Details")
     print("-" * 100)
 
-    stats = {"green": 0, "yellow": 0, "red": 0, "deepseek": 0, "glm-ocr": 0, "skipped": 0}
-    glm_pages = []
+    stats = {"green": 0, "yellow": 0, "red": 0}
+    engine_stats = {}
+    ext_ocr_pages = []
     total_time = 0
 
     for img_file in images:
@@ -46,9 +45,9 @@ def main():
         details = [d.get("code", "") for d in r.get("flag_details", [])]
 
         stats[flag] = stats.get(flag, 0) + 1
-        stats[engine] = stats.get(engine, 0) + 1
-        if engine == "glm-ocr":
-            glm_pages.append(img_file)
+        engine_stats[engine] = engine_stats.get(engine, 0) + 1
+        if ext_ocr:
+            ext_ocr_pages.append(img_file)
 
         detail_str = ", ".join(details) if details else ""
         ext_str = "YES" if ext_ocr else ""
@@ -56,10 +55,11 @@ def main():
 
     print("-" * 100)
     print(f"\nTotal time: {total_time:.1f}s ({total_time/len(images):.1f}s/page avg)")
-    print(f"Flags:  GREEN={stats['green']}  YELLOW={stats['yellow']}  RED={stats['red']}")
-    print(f"Engine: DeepSeek={stats['deepseek']}  GLM-OCR={stats['glm-ocr']}  Skipped={stats['skipped']}")
-    if glm_pages:
-        print(f"GLM-OCR used on: {', '.join(glm_pages)}")
+    print(f"Flags:  GREEN={stats.get('green',0)}  YELLOW={stats.get('yellow',0)}  RED={stats.get('red',0)}")
+    engine_str = "  ".join(f"{k}={v}" for k, v in sorted(engine_stats.items()))
+    print(f"Engine: {engine_str}")
+    if ext_ocr_pages:
+        print(f"Needs external OCR: {', '.join(ext_ocr_pages)}")
 
 if __name__ == "__main__":
     main()
