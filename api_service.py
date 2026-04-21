@@ -17,6 +17,7 @@ import uuid
 from contextlib import asynccontextmanager
 from typing import Optional
 
+import httpx
 import numpy as np
 import torch
 
@@ -87,8 +88,10 @@ REQUEST_TIMEOUT_S = int(os.environ.get("REQUEST_TIMEOUT_S", "120"))
 SCORE_THRESHOLD = float(os.environ.get("SCORE_THRESHOLD", str(DEFAULT_THRESHOLD)))
 MAX_RETRIES = int(os.environ.get("MAX_RETRIES", str(DEFAULT_MAX_RETRIES)))
 
-# External OCR routing (returned in response when needs_external_ocr=true)
-EXTERNAL_OCR_URL = os.environ.get("EXTERNAL_OCR_URL", "")
+# GLM-OCR fallback (remote service on separate machine)
+GLM_OCR_ENABLED = os.environ.get("GLM_OCR_ENABLED", "true").lower() == "true"
+GLM_OCR_URL = os.environ.get("GLM_OCR_URL", "https://rcdl6csypms0q9-8889.proxy.runpod.net/ocr/parse")
+GLM_OCR_TIMEOUT = int(os.environ.get("GLM_OCR_TIMEOUT", "120"))
 
 # Feedback storage
 FEEDBACK_DIR = os.environ.get("FEEDBACK_DIR", os.path.join(os.path.dirname(__file__), "feedback"))
@@ -183,6 +186,89 @@ def _skip_page_result(reason: str, flag_detail: str) -> dict:
     }
 
 
+async def _run_glm_ocr_fallback(image: Image.Image) -> Optional[dict]:
+    """Call remote GLM-OCR service for pages that DeepSeek-OCR failed on.
+
+    Sends the image to the GLM-OCR endpoint and scores the result
+    using the same scoring pipeline as DeepSeek-OCR.
+    """
+    if not GLM_OCR_ENABLED or not GLM_OCR_URL:
+        return None
+
+    try:
+        buf = io.BytesIO()
+        image.save(buf, format="PNG")
+        buf.seek(0)
+
+        async with httpx.AsyncClient(timeout=GLM_OCR_TIMEOUT) as client:
+            resp = await client.post(
+                GLM_OCR_URL,
+                files={"files": ("page.png", buf, "image/png")},
+            )
+            resp.raise_for_status()
+
+        data = resp.json()
+
+        # Extract text from GLM-OCR response
+        pages = data.get("pages", [])
+        if not pages:
+            logger.warning("GLM-OCR returned no pages")
+            return None
+
+        text = pages[0].get("text", "").strip()
+        num_tokens = pages[0].get("output_tokens", 0)
+
+        if len(text) < 10:
+            logger.warning("GLM-OCR returned too little text (%d chars)", len(text))
+            return None
+
+        # Score using the same pipeline as DeepSeek-OCR
+        ocr_result = OCRResult(
+            raw_text=text,
+            clean_text=text,  # GLM-OCR output is already clean
+            num_tokens=num_tokens,
+            max_tokens=MAX_TOKENS,
+            preset_name="glm-ocr",
+        )
+        score = score_result(
+            ocr_result,
+            image_width=image.width,
+            image_height=image.height,
+        )
+        flag_info = compute_flags(ocr_result, SCORE_THRESHOLD)
+
+        # Add GLM-OCR fallback notice
+        flag_info["details"].append({
+            "code": "glm_ocr_fallback",
+            "severity": "info",
+            "message": "Text extracted by GLM-OCR fallback after DeepSeek-OCR failed.",
+        })
+
+        return {
+            "text": text,
+            "raw_text": text,
+            "num_tokens": num_tokens,
+            "score": score.to_dict(),
+            "flag": flag_info["flag"],
+            "flag_message": flag_info["message"],
+            "flag_details": flag_info["details"],
+            "attempts": 0,
+            "preset": None,
+            "needs_external_ocr": False,
+            "ocr_engine": "glm-ocr",
+        }
+
+    except httpx.ConnectError:
+        logger.warning("GLM-OCR service not available at %s", GLM_OCR_URL)
+        return None
+    except httpx.TimeoutException:
+        logger.warning("GLM-OCR service timed out after %ds", GLM_OCR_TIMEOUT)
+        return None
+    except Exception as e:
+        logger.warning("GLM-OCR fallback failed: %s", e)
+        return None
+
+
 def _save_feedback(image: Image.Image, result: dict, filename: str = None):
     """Save low-scoring OCR results for future fine-tuning."""
     if not FEEDBACK_ENABLED:
@@ -227,10 +313,8 @@ def _save_feedback(image: Image.Image, result: dict, filename: str = None):
 
 
 def _mark_needs_external_ocr(result: dict) -> None:
-    """Set external OCR flag and include routing URL if configured."""
+    """Set external OCR flag."""
     result["needs_external_ocr"] = True
-    if EXTERNAL_OCR_URL:
-        result["external_ocr_url"] = EXTERNAL_OCR_URL
 
 
 def _validate_prompt(prompt: str) -> str:
@@ -326,8 +410,12 @@ async def _run_inference(image: Image.Image, prompt_key: str = DEFAULT_PROMPT) -
     return {"text": text, "num_tokens": num_tokens}
 
 
-def _format_result(inference_output: dict, raw: bool) -> dict:
-    """Build a consistent result dict from inference output."""
+async def _format_result(inference_output: dict, raw: bool, image: Image.Image = None) -> dict:
+    """Build a consistent result dict from inference output.
+
+    If the result needs external OCR and an image is provided, automatically
+    attempts GLM-OCR fallback before returning.
+    """
     text = inference_output["text"]
     num_tokens = inference_output["num_tokens"]
     stats = CleanStats()
@@ -359,13 +447,16 @@ def _format_result(inference_output: dict, raw: bool) -> dict:
     # Flag OCR extraction failure: page has content but model couldn't read it
     clean_len = len(cleaned.strip())
     raw_len = len(text.strip())
+    needs_fallback = False
+
     if clean_len <= 10 and score.composite < SCORE_THRESHOLD:
         _mark_needs_external_ocr(result)
+        needs_fallback = True
         if not any(d.get("code") == "ocr_failed" for d in result["flag_details"]):
             result["flag_details"].append({
                 "code": "ocr_failed",
                 "severity": "critical",
-                "message": "OCR extraction failed — page has content but model could not read it. Route to external OCR.",
+                "message": "OCR extraction failed — page has content but model could not read it.",
             })
 
     # Flag incomplete extraction: model hit max tokens and most output was hallucinated
@@ -377,11 +468,20 @@ def _format_result(inference_output: dict, raw: bool) -> dict:
         and score.composite < SCORE_THRESHOLD
     ):
         _mark_needs_external_ocr(result)
+        needs_fallback = True
         result["flag_details"].append({
             "code": "incomplete_extraction",
             "severity": "critical",
-            "message": f"Model hit token limit with {clean_len}/{raw_len} chars retained ({clean_len/raw_len*100:.0f}%). Most output was hallucinated. Route to external OCR.",
+            "message": f"Model hit token limit with {clean_len}/{raw_len} chars retained ({clean_len/raw_len*100:.0f}%). Most output was hallucinated.",
         })
+
+    # Auto-fallback to GLM-OCR
+    if needs_fallback and image is not None:
+        logger.info("DeepSeek-OCR failed — trying GLM-OCR fallback")
+        glm_result = await _run_glm_ocr_fallback(image)
+        if glm_result:
+            logger.info("GLM-OCR extracted %d chars (score=%.3f)", len(glm_result["text"]), glm_result["score"]["composite"])
+            return glm_result
 
     return result
 
@@ -470,13 +570,16 @@ async def _run_inference_with_retry(
     clean_len = len(best.clean_text.strip())
     raw_len = len(best.raw_text.strip())
     composite = best.score.composite if best.score else 0
+    needs_fallback = False
+
     if clean_len <= 10 and composite < SCORE_THRESHOLD:
         _mark_needs_external_ocr(result)
+        needs_fallback = True
         if not any(d.get("code") == "ocr_failed" for d in result["flag_details"]):
             result["flag_details"].append({
                 "code": "ocr_failed",
                 "severity": "critical",
-                "message": "OCR extraction failed — page has content but model could not read it. Route to external OCR.",
+                "message": "OCR extraction failed — page has content but model could not read it.",
             })
 
     # Flag incomplete extraction: model hit max tokens and most output was hallucinated
@@ -488,11 +591,21 @@ async def _run_inference_with_retry(
         and composite < SCORE_THRESHOLD
     ):
         _mark_needs_external_ocr(result)
+        needs_fallback = True
         result["flag_details"].append({
             "code": "incomplete_extraction",
             "severity": "critical",
-            "message": f"Model hit token limit with {clean_len}/{raw_len} chars retained ({clean_len/raw_len*100:.0f}%). Most output was hallucinated. Route to external OCR.",
+            "message": f"Model hit token limit with {clean_len}/{raw_len} chars retained ({clean_len/raw_len*100:.0f}%). Most output was hallucinated.",
         })
+
+    # Auto-fallback to GLM-OCR
+    if needs_fallback:
+        logger.info("DeepSeek-OCR failed — trying GLM-OCR fallback")
+        glm_result = await _run_glm_ocr_fallback(image)
+        if glm_result:
+            logger.info("GLM-OCR extracted %d chars (score=%.3f)", len(glm_result["text"]), glm_result["score"]["composite"])
+            glm_result["attempts"] = len(results)
+            return glm_result
 
     return result
 
@@ -649,7 +762,7 @@ async def ocr_image(
     else:
         enhanced = enhance_scan(image).convert("RGB")
         output = await _run_inference(enhanced, prompt)
-        result = _format_result(output, raw)
+        result = await _format_result(output, raw, image=image)
         _save_feedback(image, result, filename=file.filename)
         return JSONResponse(result)
 
@@ -699,7 +812,7 @@ async def ocr_image_base64(
     else:
         enhanced = enhance_scan(image).convert("RGB")
         output = await _run_inference(enhanced, prompt)
-        result = _format_result(output, raw)
+        result = await _format_result(output, raw, image=image)
         _save_feedback(image, result)
         return JSONResponse(result)
 
@@ -765,7 +878,7 @@ async def ocr_pdf(
     if processable_indices:
         async def _ocr_page(page_idx: int) -> tuple[int, dict]:
             output = await _run_inference(images[page_idx], prompt)
-            result = _format_result(output, raw)
+            result = await _format_result(output, raw, image=images[page_idx])
             result["page"] = page_idx + 1
             return page_idx, result
 
@@ -922,7 +1035,7 @@ async def ocr_batch(
         async def _ocr_batch_item(k: int) -> tuple[int, dict]:
             j, original_idx = processable_valid[k]
             output = await _run_inference(processable_enhanced[k], prompt)
-            result = _format_result(output, raw)
+            result = await _format_result(output, raw, image=raw_images[j])
             result["index"] = original_idx
             result["filename"] = files[original_idx].filename
             return k, result
