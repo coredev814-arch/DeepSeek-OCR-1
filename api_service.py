@@ -81,7 +81,7 @@ MAX_IMAGE_SIZE_MB = int(os.environ.get("MAX_IMAGE_SIZE_MB", "20"))
 MAX_PDF_SIZE_MB = int(os.environ.get("MAX_PDF_SIZE_MB", "100"))
 MAX_PDF_PAGES = int(os.environ.get("MAX_PDF_PAGES", "50"))
 MAX_BATCH_SIZE = int(os.environ.get("MAX_BATCH_SIZE", "16"))
-REQUEST_TIMEOUT_S = int(os.environ.get("REQUEST_TIMEOUT_S", "120"))
+REQUEST_TIMEOUT_S = int(os.environ.get("REQUEST_TIMEOUT_S", "600"))
 
 # Scoring / retry
 SCORE_THRESHOLD = float(os.environ.get("SCORE_THRESHOLD", str(DEFAULT_THRESHOLD)))
@@ -91,7 +91,7 @@ MAX_RETRIES = int(os.environ.get("MAX_RETRIES", str(DEFAULT_MAX_RETRIES)))
 GLM_OCR_ENABLED = os.environ.get("GLM_OCR_ENABLED", "true").lower() == "true"
 GLM_OCR_MODEL_PATH = os.environ.get("GLM_OCR_MODEL_PATH", "/workspace/models/GLM-OCR")
 GLM_OCR_VENV_PYTHON = os.environ.get("GLM_OCR_VENV_PYTHON", "/workspace/glm-ocr-venv/bin/python")
-GLM_OCR_TIMEOUT = int(os.environ.get("GLM_OCR_TIMEOUT", "180"))
+GLM_OCR_TIMEOUT = int(os.environ.get("GLM_OCR_TIMEOUT", "300"))
 
 # Feedback storage
 FEEDBACK_DIR = os.environ.get("FEEDBACK_DIR", os.path.join(os.path.dirname(__file__), "feedback"))
