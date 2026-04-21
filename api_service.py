@@ -18,9 +18,7 @@ from contextlib import asynccontextmanager
 from typing import Optional
 
 import numpy as np
-import pytesseract
 import torch
-from scipy import ndimage
 
 os.environ["VLLM_USE_V1"] = "0"
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
@@ -88,9 +86,6 @@ REQUEST_TIMEOUT_S = int(os.environ.get("REQUEST_TIMEOUT_S", "120"))
 # Scoring / retry
 SCORE_THRESHOLD = float(os.environ.get("SCORE_THRESHOLD", str(DEFAULT_THRESHOLD)))
 MAX_RETRIES = int(os.environ.get("MAX_RETRIES", str(DEFAULT_MAX_RETRIES)))
-
-# Tesseract fallback
-TESSERACT_FALLBACK = os.environ.get("TESSERACT_FALLBACK", "true").lower() == "true"
 
 # External OCR routing (returned in response when needs_external_ocr=true)
 EXTERNAL_OCR_URL = os.environ.get("EXTERNAL_OCR_URL", "")
@@ -188,57 +183,6 @@ def _skip_page_result(reason: str, flag_detail: str) -> dict:
     }
 
 
-def _preprocess_for_tesseract(image: Image.Image) -> Image.Image:
-    """Adaptive thresholding to remove watermarks and normalize contrast."""
-    gray = np.array(image.convert("L")).astype(float)
-    background = ndimage.gaussian_filter(gray, sigma=25)
-    normalized = gray - background + 128
-    normalized = np.clip(normalized, 0, 255).astype(np.uint8)
-    return Image.fromarray(normalized)
-
-
-def _run_tesseract_fallback(image: Image.Image) -> Optional[dict]:
-    """Try Tesseract OCR as fallback. Returns result dict or None."""
-    try:
-        preprocessed = _preprocess_for_tesseract(image)
-        text = pytesseract.image_to_string(preprocessed, lang="eng")
-        text = text.strip()
-
-        if len(text) < 10:
-            return None
-
-        return {
-            "text": text,
-            "raw_text": text,
-            "num_tokens": 0,
-            "score": {
-                "composite": 0.50,
-                "variables": {
-                    "self_consistency": 1.0,
-                    "hallucination_ratio": 1.0,
-                    "token_efficiency": 1.0,
-                    "structural_integrity": 0.0,
-                    "repetition_density": 1.0,
-                    "content_density": 0.0,
-                },
-            },
-            "flag": "yellow",
-            "flag_message": f"Tesseract fallback — extracted {len(text)} chars. Verify accuracy.",
-            "flag_details": [{
-                "code": "tesseract_fallback",
-                "severity": "warning",
-                "message": "Text extracted by Tesseract fallback — accuracy may vary.",
-            }],
-            "attempts": 0,
-            "preset": None,
-            "needs_external_ocr": False,
-            "ocr_engine": "tesseract",
-        }
-    except Exception as e:
-        logger.warning("Tesseract fallback failed: %s", e)
-        return None
-
-
 def _save_feedback(image: Image.Image, result: dict, filename: str = None):
     """Save low-scoring OCR results for future fine-tuning."""
     if not FEEDBACK_ENABLED:
@@ -247,8 +191,7 @@ def _save_feedback(image: Image.Image, result: dict, filename: str = None):
     score = result.get("score", {}).get("composite", 1.0)
     engine_used = result.get("ocr_engine", "deepseek")
 
-    # Save if score is below threshold or if Tesseract was used
-    if score >= FEEDBACK_SCORE_THRESHOLD and engine_used != "tesseract":
+    if score >= FEEDBACK_SCORE_THRESHOLD:
         return
 
     timestamp = time.strftime("%Y%m%d_%H%M%S")
@@ -528,15 +471,6 @@ async def _run_inference_with_retry(
     raw_len = len(best.raw_text.strip())
     composite = best.score.composite if best.score else 0
     if clean_len <= 10 and composite < SCORE_THRESHOLD:
-        # Try Tesseract fallback before giving up
-        if TESSERACT_FALLBACK:
-            logger.info("DeepSeek-OCR failed — trying Tesseract fallback")
-            fallback = _run_tesseract_fallback(image)
-            if fallback:
-                logger.info("Tesseract fallback extracted %d chars", len(fallback["text"]))
-                fallback["attempts"] = len(results)
-                return fallback
-
         _mark_needs_external_ocr(result)
         if not any(d.get("code") == "ocr_failed" for d in result["flag_details"]):
             result["flag_details"].append({
