@@ -18,9 +18,7 @@ from contextlib import asynccontextmanager
 from typing import Optional
 
 import numpy as np
-import pytesseract
 import torch
-from scipy import ndimage
 
 os.environ["VLLM_USE_V1"] = "0"
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
@@ -89,8 +87,11 @@ REQUEST_TIMEOUT_S = int(os.environ.get("REQUEST_TIMEOUT_S", "120"))
 SCORE_THRESHOLD = float(os.environ.get("SCORE_THRESHOLD", str(DEFAULT_THRESHOLD)))
 MAX_RETRIES = int(os.environ.get("MAX_RETRIES", str(DEFAULT_MAX_RETRIES)))
 
-# Tesseract fallback
-TESSERACT_FALLBACK = os.environ.get("TESSERACT_FALLBACK", "true").lower() == "true"
+# GLM-OCR fallback (subprocess worker with isolated transformers 5.x)
+GLM_OCR_ENABLED = os.environ.get("GLM_OCR_ENABLED", "true").lower() == "true"
+GLM_OCR_MODEL_PATH = os.environ.get("GLM_OCR_MODEL_PATH", "/workspace/models/GLM-OCR")
+GLM_OCR_VENV_PYTHON = os.environ.get("GLM_OCR_VENV_PYTHON", "/workspace/glm-ocr-venv/bin/python")
+GLM_OCR_TIMEOUT = int(os.environ.get("GLM_OCR_TIMEOUT", "180"))
 
 # Feedback storage
 FEEDBACK_DIR = os.environ.get("FEEDBACK_DIR", os.path.join(os.path.dirname(__file__), "feedback"))
@@ -115,6 +116,8 @@ DEFAULT_PROMPT = "document"
 engine: Optional[AsyncLLMEngine] = None
 sampling_params: Optional[SamplingParams] = None
 processor: Optional[DeepseekOCRProcessor] = None
+_glm_ocr_process: Optional[asyncio.subprocess.Process] = None
+_glm_ocr_lock: asyncio.Lock = None  # initialized in lifespan
 
 
 # ---------------------------------------------------------------------------
@@ -185,55 +188,157 @@ def _skip_page_result(reason: str, flag_detail: str) -> dict:
     }
 
 
-def _preprocess_for_tesseract(image: Image.Image) -> Image.Image:
-    """Adaptive thresholding to remove watermarks and normalize contrast."""
-    gray = np.array(image.convert("L")).astype(float)
-    background = ndimage.gaussian_filter(gray, sigma=25)
-    normalized = gray - background + 128
-    normalized = np.clip(normalized, 0, 255).astype(np.uint8)
-    return Image.fromarray(normalized)
+async def _ensure_glm_ocr_worker() -> bool:
+    """Start the GLM-OCR worker subprocess if not already running.
 
+    Returns True if the worker is ready, False if it can't start.
+    """
+    global _glm_ocr_process
 
-def _run_tesseract_fallback(image: Image.Image) -> Optional[dict]:
-    """Try Tesseract OCR as fallback. Returns result dict or None."""
+    if _glm_ocr_process is not None and _glm_ocr_process.returncode is None:
+        return True  # already running
+
+    if not os.path.exists(GLM_OCR_VENV_PYTHON):
+        logger.warning("GLM-OCR venv not found at %s — fallback disabled", GLM_OCR_VENV_PYTHON)
+        return False
+
+    if not os.path.exists(GLM_OCR_MODEL_PATH):
+        logger.warning("GLM-OCR model not found at %s — fallback disabled", GLM_OCR_MODEL_PATH)
+        return False
+
+    worker_script = os.path.join(os.path.dirname(__file__), "glm_ocr_worker.py")
+    logger.info("Starting GLM-OCR worker subprocess...")
+
+    _glm_ocr_process = await asyncio.create_subprocess_exec(
+        GLM_OCR_VENV_PYTHON, worker_script,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        env={**os.environ, "GLM_OCR_MODEL_PATH": GLM_OCR_MODEL_PATH},
+    )
+
+    # Wait for "ready" signal (model loading takes a few seconds)
     try:
-        preprocessed = _preprocess_for_tesseract(image)
-        text = pytesseract.image_to_string(preprocessed, lang="eng")
-        text = text.strip()
+        ready_line = await asyncio.wait_for(
+            _glm_ocr_process.stdout.readline(), timeout=120
+        )
+        import json as _json
+        status = _json.loads(ready_line.decode())
+        if status.get("status") == "ready":
+            logger.info("GLM-OCR worker ready (PID %d)", _glm_ocr_process.pid)
+            return True
+    except asyncio.TimeoutError:
+        logger.error("GLM-OCR worker timed out during startup")
+        _glm_ocr_process.kill()
+        _glm_ocr_process = None
+        return False
+    except Exception as e:
+        logger.error("GLM-OCR worker startup failed: %s", e)
+        if _glm_ocr_process:
+            _glm_ocr_process.kill()
+            _glm_ocr_process = None
+        return False
 
-        if len(text) < 10:
+    return False
+
+
+async def _run_glm_ocr_fallback(image: Image.Image) -> Optional[dict]:
+    """Try GLM-OCR as fallback via subprocess worker.
+
+    Sends the image as base64 to the worker process and returns a result
+    dict, or None if the worker is unavailable or extraction fails.
+    """
+    global _glm_ocr_process
+
+    if not GLM_OCR_ENABLED:
+        return None
+
+    import json as _json
+
+    async with _glm_ocr_lock:
+        if not await _ensure_glm_ocr_worker():
             return None
 
-        return {
-            "text": text,
-            "raw_text": text,
-            "num_tokens": 0,
-            "score": {
-                "composite": 0.50,
-                "variables": {
-                    "self_consistency": 1.0,
-                    "hallucination_ratio": 1.0,
-                    "token_efficiency": 1.0,
-                    "structural_integrity": 0.0,
-                    "repetition_density": 1.0,
-                    "content_density": 0.0,
-                },
-            },
-            "flag": "yellow",
-            "flag_message": f"Tesseract fallback — extracted {len(text)} chars. Verify accuracy.",
-            "flag_details": [{
-                "code": "tesseract_fallback",
+        try:
+            # Encode image to base64
+            buf = io.BytesIO()
+            image.save(buf, format="PNG")
+            b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+
+            request = _json.dumps({"image_base64": b64, "max_tokens": MAX_TOKENS}) + "\n"
+            _glm_ocr_process.stdin.write(request.encode())
+            await _glm_ocr_process.stdin.drain()
+
+            # Read response with timeout
+            response_line = await asyncio.wait_for(
+                _glm_ocr_process.stdout.readline(), timeout=GLM_OCR_TIMEOUT
+            )
+
+            if not response_line:
+                logger.error("GLM-OCR worker returned empty response")
+                _glm_ocr_process = None
+                return None
+
+            data = _json.loads(response_line.decode())
+
+            if "error" in data:
+                logger.warning("GLM-OCR worker error: %s", data["error"])
+                return None
+
+            text = data["text"].strip()
+            num_tokens = data.get("num_tokens", 0)
+
+            if len(text) < 10:
+                logger.warning("GLM-OCR returned too little text (%d chars)", len(text))
+                return None
+
+            # Score using the same scoring system as DeepSeek-OCR
+            ocr_result = OCRResult(
+                raw_text=text,
+                clean_text=text,  # GLM-OCR output is already clean
+                num_tokens=num_tokens,
+                max_tokens=MAX_TOKENS,
+                preset_name="glm-ocr",
+            )
+            score = score_result(ocr_result)
+            flag_info = compute_flags(ocr_result, SCORE_THRESHOLD)
+
+            # Add GLM-OCR fallback detail
+            flag_info["details"].append({
+                "code": "glm_ocr_fallback",
                 "severity": "warning",
-                "message": "Text extracted by Tesseract fallback — accuracy may vary.",
-            }],
-            "attempts": 0,
-            "preset": None,
-            "needs_external_ocr": False,
-            "ocr_engine": "tesseract",
-        }
-    except Exception as e:
-        logger.warning("Tesseract fallback failed: %s", e)
-        return None
+                "message": "Text extracted by GLM-OCR fallback after DeepSeek-OCR failed.",
+            })
+            # Fallback results are always at most YELLOW
+            if flag_info["flag"] == "green":
+                flag_info["flag"] = "yellow"
+                flag_info["message"] = f"GLM-OCR fallback (score {score.composite:.2f}). Verify accuracy."
+
+            return {
+                "text": text,
+                "raw_text": text,
+                "num_tokens": num_tokens,
+                "score": score.to_dict(),
+                "flag": flag_info["flag"],
+                "flag_message": flag_info["message"],
+                "flag_details": flag_info["details"],
+                "attempts": 0,
+                "preset": None,
+                "needs_external_ocr": False,
+                "ocr_engine": "glm-ocr",
+            }
+
+        except asyncio.TimeoutError:
+            logger.error("GLM-OCR worker timed out after %ds", GLM_OCR_TIMEOUT)
+            if _glm_ocr_process:
+                _glm_ocr_process.kill()
+                _glm_ocr_process = None
+            return None
+        except Exception as e:
+            logger.warning("GLM-OCR fallback failed: %s", e)
+            if _glm_ocr_process and _glm_ocr_process.returncode is not None:
+                _glm_ocr_process = None
+            return None
 
 
 def _save_feedback(image: Image.Image, result: dict, filename: str = None):
@@ -245,7 +350,7 @@ def _save_feedback(image: Image.Image, result: dict, filename: str = None):
     engine_used = result.get("ocr_engine", "deepseek")
 
     # Save if score is below threshold or if Tesseract was used
-    if score >= FEEDBACK_SCORE_THRESHOLD and engine_used != "tesseract":
+    if score >= FEEDBACK_SCORE_THRESHOLD and engine_used not in ("glm-ocr",):
         return
 
     timestamp = time.strftime("%Y%m%d_%H%M%S")
@@ -373,8 +478,12 @@ async def _run_inference(image: Image.Image, prompt_key: str = DEFAULT_PROMPT) -
     return {"text": text, "num_tokens": num_tokens}
 
 
-def _format_result(inference_output: dict, raw: bool) -> dict:
-    """Build a consistent result dict from inference output."""
+async def _format_result(inference_output: dict, raw: bool, image: Image.Image = None) -> dict:
+    """Build a consistent result dict from inference output.
+
+    If the result needs external OCR and GLM-OCR is available, automatically
+    falls back to GLM-OCR before returning.
+    """
     text = inference_output["text"]
     num_tokens = inference_output["num_tokens"]
     stats = CleanStats()
@@ -429,6 +538,14 @@ def _format_result(inference_output: dict, raw: bool) -> dict:
             "severity": "critical",
             "message": f"Model hit token limit with {clean_len}/{raw_len} chars retained ({clean_len/raw_len*100:.0f}%). Most output was hallucinated. Route to external OCR.",
         })
+
+    # Auto-fallback to GLM-OCR if needed and image is available
+    if result["needs_external_ocr"] and image is not None:
+        logger.info("DeepSeek-OCR needs external OCR — trying GLM-OCR fallback")
+        glm_result = await _run_glm_ocr_fallback(image)
+        if glm_result:
+            logger.info("GLM-OCR fallback extracted %d chars", len(glm_result["text"]))
+            return glm_result
 
     return result
 
@@ -509,17 +626,11 @@ async def _run_inference_with_retry(
     clean_len = len(best.clean_text.strip())
     raw_len = len(best.raw_text.strip())
     composite = best.score.composite if best.score else 0
-    if clean_len <= 10 and composite < SCORE_THRESHOLD:
-        # Try Tesseract fallback before giving up
-        if TESSERACT_FALLBACK:
-            logger.info("DeepSeek-OCR failed — trying Tesseract fallback")
-            fallback = _run_tesseract_fallback(image)
-            if fallback:
-                logger.info("Tesseract fallback extracted %d chars", len(fallback["text"]))
-                fallback["attempts"] = len(results)
-                return fallback
+    needs_fallback = False
 
+    if clean_len <= 10 and composite < SCORE_THRESHOLD:
         result["needs_external_ocr"] = True
+        needs_fallback = True
         if not any(d.get("code") == "ocr_failed" for d in result["flag_details"]):
             result["flag_details"].append({
                 "code": "ocr_failed",
@@ -536,11 +647,21 @@ async def _run_inference_with_retry(
         and composite < SCORE_THRESHOLD
     ):
         result["needs_external_ocr"] = True
+        needs_fallback = True
         result["flag_details"].append({
             "code": "incomplete_extraction",
             "severity": "critical",
             "message": f"Model hit token limit with {clean_len}/{raw_len} chars retained ({clean_len/raw_len*100:.0f}%). Most output was hallucinated. Route to external OCR.",
         })
+
+    # Auto-fallback to GLM-OCR
+    if needs_fallback:
+        logger.info("DeepSeek-OCR needs external OCR — trying GLM-OCR fallback")
+        glm_result = await _run_glm_ocr_fallback(image)
+        if glm_result:
+            logger.info("GLM-OCR fallback extracted %d chars", len(glm_result["text"]))
+            glm_result["attempts"] = len(results)
+            return glm_result
 
     return result
 
@@ -561,9 +682,10 @@ def _check_file_size(data: bytes, max_mb: int, label: str = "File"):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup: load AsyncLLMEngine.  Shutdown: release resources."""
-    global engine, sampling_params, processor
+    global engine, sampling_params, processor, _glm_ocr_lock
 
     # ---- Startup ----
+    _glm_ocr_lock = asyncio.Lock()
     logger.info("Loading model from %s …", MODEL_PATH)
     ModelRegistry.register_model("DeepseekOCRForCausalLM", DeepseekOCRForCausalLM)
 
@@ -608,6 +730,9 @@ async def lifespan(app: FastAPI):
 
     # ---- Shutdown ----
     logger.info("Shutting down …")
+    if _glm_ocr_process and _glm_ocr_process.returncode is None:
+        logger.info("Stopping GLM-OCR worker (PID %d)…", _glm_ocr_process.pid)
+        _glm_ocr_process.kill()
     if engine:
         engine.shutdown_background_loop()
     if torch.cuda.is_available():
@@ -697,7 +822,7 @@ async def ocr_image(
     else:
         enhanced = enhance_scan(image).convert("RGB")
         output = await _run_inference(enhanced, prompt)
-        result = _format_result(output, raw)
+        result = await _format_result(output, raw, image=image)
         _save_feedback(image, result, filename=file.filename)
         return JSONResponse(result)
 
@@ -747,7 +872,7 @@ async def ocr_image_base64(
     else:
         enhanced = enhance_scan(image).convert("RGB")
         output = await _run_inference(enhanced, prompt)
-        result = _format_result(output, raw)
+        result = await _format_result(output, raw, image=image)
         _save_feedback(image, result)
         return JSONResponse(result)
 
@@ -813,7 +938,7 @@ async def ocr_pdf(
     if processable_indices:
         async def _ocr_page(page_idx: int) -> tuple[int, dict]:
             output = await _run_inference(images[page_idx], prompt)
-            result = _format_result(output, raw)
+            result = await _format_result(output, raw, image=images[page_idx])
             result["page"] = page_idx + 1
             return page_idx, result
 
@@ -970,7 +1095,7 @@ async def ocr_batch(
         async def _ocr_batch_item(k: int) -> tuple[int, dict]:
             j, original_idx = processable_valid[k]
             output = await _run_inference(processable_enhanced[k], prompt)
-            result = _format_result(output, raw)
+            result = await _format_result(output, raw, image=raw_images[j])
             result["index"] = original_idx
             result["filename"] = files[original_idx].filename
             return k, result
