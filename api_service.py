@@ -11,6 +11,7 @@ import base64
 import io
 import logging
 import os
+import re
 import sys
 import time
 import uuid
@@ -89,7 +90,7 @@ SCORE_THRESHOLD = float(os.environ.get("SCORE_THRESHOLD", str(DEFAULT_THRESHOLD)
 MAX_RETRIES = int(os.environ.get("MAX_RETRIES", str(DEFAULT_MAX_RETRIES)))
 
 # GLM-OCR fallback (remote service on separate machine)
-GLM_OCR_ENABLED = os.environ.get("GLM_OCR_ENABLED", "true").lower() == "true"
+GLM_OCR_ENABLED = os.environ.get("GLM_OCR_ENABLED", "false").lower() == "true"
 GLM_OCR_URL = os.environ.get("GLM_OCR_URL", "https://rcdl6csypms0q9-8889.proxy.runpod.net/ocr/parse")
 GLM_OCR_TIMEOUT = int(os.environ.get("GLM_OCR_TIMEOUT", "300"))
 
@@ -157,6 +158,41 @@ def is_low_quality_scan(image: Image.Image, content_area_threshold: float = 0.12
     content_area_ratio = (content_h * content_w) / (h * w)
 
     return content_area_ratio < content_area_threshold
+
+
+_BOILERPLATE_PATTERNS = re.compile(
+    r"^("
+    r"page\s*\d+|p\.?\s*\d+|\d+\s*/\s*\d+"          # page numbers
+    r"|\-\s*\d+\s*\-|\d+"                              # bare numbers, dash-wrapped
+    r"|[-=*_~]{3,}"                                     # dividers
+    r"|\.{3,}"                                          # dot leaders
+    r"|\s+"                                             # whitespace-only lines
+    r")$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+POST_OCR_BLANK_CHAR_LIMIT = int(os.environ.get("POST_OCR_BLANK_CHAR_LIMIT", "20"))
+
+
+def _is_boilerplate_only(text: str) -> bool:
+    """Return True if text consists only of boilerplate (page numbers, dividers, etc.)."""
+    stripped = text.strip()
+    if not stripped:
+        return True
+    # Remove all boilerplate patterns and see if anything remains
+    cleaned = _BOILERPLATE_PATTERNS.sub("", stripped).strip()
+    return len(cleaned) == 0
+
+
+def _is_post_ocr_blank(clean_text: str) -> bool:
+    """Return True if OCR output indicates a blank/near-blank page.
+
+    Checks: text shorter than threshold OR only boilerplate content.
+    """
+    stripped = clean_text.strip()
+    if len(stripped) < POST_OCR_BLANK_CHAR_LIMIT:
+        return True
+    return _is_boilerplate_only(stripped)
 
 
 def _skip_page_result(reason: str, flag_detail: str) -> dict:
@@ -444,8 +480,22 @@ async def _format_result(inference_output: dict, raw: bool, image: Image.Image =
         "ocr_engine": "deepseek",
     }
 
-    # Flag OCR extraction failure: page has content but model couldn't read it
+    # Post-OCR blank page detection: skip LLM classification for near-blank pages
     clean_len = len(cleaned.strip())
+    if _is_post_ocr_blank(cleaned):
+        logger.info("Post-OCR blank page detected (%d chars): %r", clean_len, cleaned.strip()[:50])
+        result["flag"] = "red"
+        result["flag_message"] = "Blank page detected after OCR — no meaningful content."
+        result["flag_details"] = [{
+            "code": "blank_page",
+            "severity": "info",
+            "message": f"Page produced only {clean_len} chars of boilerplate/empty content after OCR.",
+        }]
+        result["needs_external_ocr"] = False
+        result["ocr_engine"] = "deepseek"
+        return result
+
+    # Flag OCR extraction failure: page has content but model couldn't read it
     raw_len = len(text.strip())
     needs_fallback = False
 
@@ -566,8 +616,21 @@ async def _run_inference_with_retry(
         "ocr_engine": "deepseek",
     }
 
-    # Flag OCR extraction failure: page has content but model couldn't read it
+    # Post-OCR blank page detection: skip LLM classification for near-blank pages
     clean_len = len(best.clean_text.strip())
+    if _is_post_ocr_blank(best.clean_text):
+        logger.info("Post-OCR blank page detected (%d chars): %r", clean_len, best.clean_text.strip()[:50])
+        result["flag"] = "red"
+        result["flag_message"] = "Blank page detected after OCR — no meaningful content."
+        result["flag_details"] = [{
+            "code": "blank_page",
+            "severity": "info",
+            "message": f"Page produced only {clean_len} chars of boilerplate/empty content after OCR.",
+        }]
+        result["needs_external_ocr"] = False
+        return result
+
+    # Flag OCR extraction failure: page has content but model couldn't read it
     raw_len = len(best.raw_text.strip())
     composite = best.score.composite if best.score else 0
     needs_fallback = False
