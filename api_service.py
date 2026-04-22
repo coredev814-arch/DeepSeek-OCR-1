@@ -214,7 +214,7 @@ def _skip_page_result(reason: str, flag_detail: str) -> dict:
         },
         "flag": "red",
         "flag_message": reason,
-        "flag_details": [flag_detail],
+        "flag_details": [{"code": flag_detail, "severity": "info", "message": reason}],
         "attempts": 0,
         "preset": None,
         "needs_external_ocr": False,
