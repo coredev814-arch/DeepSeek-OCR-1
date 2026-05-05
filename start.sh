@@ -12,6 +12,10 @@ set -e
 
 export VLLM_USE_V1=0
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
+# Raise vLLM's per-iteration deadline (default 60s). Long pages on dense docs
+# can exceed 60s under load; without this, one slow iteration kills the
+# AsyncLLMEngine background loop and every subsequent request returns 500.
+export VLLM_ENGINE_ITERATION_TIMEOUT_S=${VLLM_ENGINE_ITERATION_TIMEOUT_S:-180}
 
 MODEL_PATH=${MODEL_PATH:-/workspace/models/DeepSeek-OCR}
 PORT=${PORT:-8000}
@@ -24,6 +28,6 @@ echo "Port:     $PORT"
 echo "GPU:      $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || echo 'unknown')"
 echo "============================================"
 
-cd /workspace/DeepSeek-OCR
+cd "$(dirname "$0")"
 
 python3 api_service.py
