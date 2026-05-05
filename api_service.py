@@ -391,9 +391,12 @@ async def _format_result(inference_output: dict, raw: bool, image: Image.Image =
         "ocr_engine": "deepseek",
     }
 
-    # Post-OCR blank page detection: skip LLM classification for near-blank pages
+    # Post-OCR blank page detection: only flag as blank if the image itself
+    # also looks blank/low-quality. If the image has content but OCR returned
+    # nothing, that's an OCR failure — not a blank page.
     clean_len = len(cleaned.strip())
-    if _is_post_ocr_blank(cleaned):
+    image_looks_blank = image is not None and (is_blank_page(image) or is_low_quality_scan(image))
+    if _is_post_ocr_blank(cleaned) and image_looks_blank:
         logger.info("Post-OCR blank page detected (%d chars): %r", clean_len, cleaned.strip()[:50])
         result["flag"] = "red"
         result["flag_message"] = "Blank page detected after OCR — no meaningful content."
@@ -519,9 +522,12 @@ async def _run_inference_with_retry(
         "ocr_engine": "deepseek",
     }
 
-    # Post-OCR blank page detection: skip LLM classification for near-blank pages
+    # Post-OCR blank page detection: only flag as blank if the image itself
+    # also looks blank/low-quality. If the image has content but OCR returned
+    # nothing, that's an OCR failure — not a blank page.
     clean_len = len(best.clean_text.strip())
-    if _is_post_ocr_blank(best.clean_text):
+    image_looks_blank = is_blank_page(image) or is_low_quality_scan(image)
+    if _is_post_ocr_blank(best.clean_text) and image_looks_blank:
         logger.info("Post-OCR blank page detected (%d chars): %r", clean_len, best.clean_text.strip()[:50])
         result["flag"] = "red"
         result["flag_message"] = "Blank page detected after OCR — no meaningful content."
@@ -657,8 +663,19 @@ async def root():
 
 @app.get("/health")
 async def health():
-    return {
-        "status": "healthy" if engine is not None else "loading",
+    if engine is None:
+        status = "loading"
+        engine_error = None
+    elif getattr(engine, "errored", False):
+        status = "dead"
+        dead = getattr(engine, "dead_error", None)
+        engine_error = repr(dead) if dead else "background loop errored"
+    else:
+        status = "healthy"
+        engine_error = None
+
+    body = {
+        "status": status,
         "model": MODEL_PATH,
         "gpu": (
             torch.cuda.get_device_name(0) if torch.cuda.is_available() else "none"
@@ -668,6 +685,9 @@ async def health():
             "max_retries": MAX_RETRIES,
         },
     }
+    if engine_error:
+        body["engine_error"] = engine_error
+    return JSONResponse(body, status_code=200 if status == "healthy" else 503)
 
 
 @app.post("/ocr/image")
