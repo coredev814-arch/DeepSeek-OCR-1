@@ -11,7 +11,6 @@
 - [Quality Scoring System](#quality-scoring-system)
 - [Retry Logic](#retry-logic)
 - [Pre-flight Detection](#pre-flight-detection)
-- [Tesseract Fallback](#tesseract-fallback)
 - [External OCR Routing](#external-ocr-routing)
 - [Feedback System](#feedback-system)
 - [API Endpoints](#api-endpoints)
@@ -104,12 +103,11 @@ A single `/ocr/image` request with `retry=true` follows this path:
 
 6. External OCR routing check
    ├── Clean text ≤ 10 chars → needs_external_ocr: true
-   │   └── Try Tesseract fallback first
    └── Token limit hit (≥85% max) + >90% hallucinated + low score
        → needs_external_ocr: true (incomplete_extraction)
 
 7. Feedback storage
-   └── Score < 0.70 or Tesseract used → save image + metadata to feedback/pending/
+   └── Score < 0.70 → save image + metadata to feedback/pending/
 
 8. JSON response returned
 ```
@@ -475,35 +473,6 @@ Result: RED flag, `low_quality_scan` detail, zero text, `ocr_engine: "skipped"`.
 
 ---
 
-## Tesseract Fallback
-
-When DeepSeek-OCR extracts no meaningful text (≤10 chars) from a non-blank page:
-
-```
-DeepSeek result: ≤ 10 chars clean text
-        │
-        ▼
-┌──────────────────────────┐
-│  Preprocessing           │
-│  Adaptive thresholding:  │
-│  ├── Gaussian blur σ=25  │
-│  ├── Background subtract │
-│  └── Normalize to 0-255  │
-└──────────┬───────────────┘
-           │
-           ▼
-┌──────────────────────────┐
-│  pytesseract (eng)       │
-│  ├── Success (≥10 chars) │  → Return with ocr_engine: "tesseract"
-│  │   flag: YELLOW        │    score: 0.50
-│  └── Failure (<10 chars) │  → needs_external_ocr: true
-└──────────────────────────┘
-```
-
-Disable with: `TESSERACT_FALLBACK=false`
-
----
-
 ## External OCR Routing
 
 The `needs_external_ocr` flag tells callers to route the page to an external OCR service. Two conditions trigger it:
@@ -511,7 +480,7 @@ The `needs_external_ocr` flag tells callers to route the page to an external OCR
 ### Condition 1: OCR Failed (empty extraction)
 
 ```
-clean_text ≤ 10 chars AND composite < 0.60 AND Tesseract fallback also failed
+clean_text ≤ 10 chars AND composite < 0.60
 → needs_external_ocr: true
 → flag_detail: "ocr_failed"
 ```
@@ -541,9 +510,9 @@ Automatically stores low-scoring results for future LoRA fine-tuning.
 ```
 OCR Result
     │
-    ├── Score ≥ 0.70 AND engine != tesseract → NOT saved (no disk wasted)
+    ├── Score ≥ 0.70 → NOT saved (no disk wasted)
     │
-    └── Score < 0.70 OR engine == tesseract
+    └── Score < 0.70
         │
         ▼
   feedback/pending/
@@ -569,7 +538,6 @@ OCR Result
 | GREEN (≥ 0.70) | No |
 | YELLOW (0.50-0.69) | Yes |
 | RED (< 0.50) | Yes |
-| Tesseract fallback used | Yes |
 
 Estimated ~5% of pages saved. Storage: ~210 KB per entry (image + JSON metadata).
 
@@ -643,7 +611,6 @@ All OCR endpoints return:
 | `incomplete_extraction` | critical | Model hit token limit, >90% hallucinated |
 | `blank_page` | critical | Blank page skipped |
 | `low_quality_scan` | critical | Content too small, skipped |
-| `tesseract_fallback` | warning | Tesseract used, verify accuracy |
 | `possible_hallucination` | warning | >75% of output removed |
 | `max_tokens_hit` | warning | Stuck generation loop |
 | `repetitive_content` | info | Repetitive patterns detected |
@@ -671,7 +638,6 @@ All OCR endpoints return:
 | `REQUEST_TIMEOUT_S` | `120` | Request timeout (seconds) |
 | `SCORE_THRESHOLD` | `0.60` | Score below this triggers retry |
 | `MAX_RETRIES` | `3` | Max retry attempts per page |
-| `TESSERACT_FALLBACK` | `true` | Enable Tesseract fallback |
 | `FEEDBACK_DIR` | `./feedback` | Feedback storage path |
 | `FEEDBACK_ENABLED` | `true` | Enable feedback storage |
 | `FEEDBACK_SCORE_THRESHOLD` | `0.70` | Save results below this score |
@@ -694,7 +660,6 @@ DeepSeek-OCR-1/
 │   ├── Pre-flight: blank page + low-quality scan detection
 │   ├── Inference: async generate via vLLM
 │   ├── Retry: up to 3 enhancement presets
-│   ├── Fallback: Tesseract OCR
 │   ├── Feedback: auto-save low-scoring results
 │   └── Endpoints: /ocr/image, /ocr/pdf, /ocr/batch, /feedback/*
 │
@@ -740,8 +705,7 @@ DeepSeek-OCR-1/
 | `uvicorn` | 0.42.0 | ASGI server |
 | `pillow` | 12.1.1 | Image loading and manipulation |
 | `PyMuPDF` | 1.27.2 | PDF to image conversion |
-| `pytesseract` | - | Tesseract OCR fallback |
-| `scipy` | 1.17.1 | Adaptive thresholding for Tesseract preprocessing |
+| `scipy` | 1.17.1 | Numerical utilities |
 | `numpy` | 1.26.4 | Image array operations |
 
 ---
@@ -758,7 +722,6 @@ DeepSeek-OCR-1/
 | RED (manual review) | 1.9% of pages |
 | Average composite score | 0.876 |
 | Blank/low-quality skip time | ~1ms |
-| Tesseract fallback success | 100% (1/1) |
 | Total chars extracted | 131,610 |
 
 ### Concurrent Request Throughput

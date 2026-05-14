@@ -1,6 +1,6 @@
 # DeepSeek-OCR API Service
 
-Production-ready OCR API powered by DeepSeek-OCR with intelligent quality scoring, automatic retry, Tesseract fallback, and feedback-driven learning.
+Production-ready OCR API powered by DeepSeek-OCR with intelligent quality scoring, automatic retry, and feedback-driven learning.
 
 ## Architecture
 
@@ -39,13 +39,7 @@ Image Upload
 │     └─ Retry (up to 3x) │  Different enhancement presets
 └────────┬────────────────┘
          │
-         ▼ if score still low and clean_text <= 10 chars
-┌─────────────────────────┐
-│  Tesseract Fallback     │  Adaptive threshold preprocessing
-│  └─ Extract text        │  ~0.5s
-└────────┬────────────────┘
-         │
-         ▼ if score < 0.70 or tesseract used
+         ▼ if score < 0.70
 ┌─────────────────────────┐
 │  Feedback Storage       │  Save (image, text) pair for fine-tuning
 │  └─ feedback/pending/   │
@@ -163,7 +157,7 @@ curl http://localhost:8000/feedback/stats
   "verified": 12,
   "total": 17,
   "ready_for_training": false,
-  "engines": {"deepseek": 4, "tesseract": 1},
+  "engines": {"deepseek": 5},
   "disk_usage_mb": 3.42
 }
 ```
@@ -185,7 +179,7 @@ curl http://localhost:8000/feedback/pending
       "filename": "page_2.png",
       "score": 0.5,
       "flag": "yellow",
-      "ocr_engine": "tesseract",
+      "ocr_engine": "deepseek",
       "text_length": 2260
     }
   ],
@@ -238,7 +232,6 @@ All OCR endpoints return:
 | Value | Meaning |
 |-------|---------|
 | `deepseek` | Primary model extracted text successfully |
-| `tesseract` | DeepSeek failed, Tesseract fallback extracted text |
 | `skipped` | Page skipped (blank or low-quality scan) |
 
 ### `flag` Values
@@ -257,7 +250,6 @@ All OCR endpoints return:
 | `ocr_failed` | critical | Page has content but model couldn't read it |
 | `blank_page` | critical | Blank page detected and skipped |
 | `low_quality_scan` | critical | Content too small to read, skipped |
-| `tesseract_fallback` | warning | Text extracted by Tesseract, verify accuracy |
 | `possible_hallucination` | warning | >75% of output removed as hallucinated |
 | `max_tokens_hit` | warning | Model stuck in generation loop |
 | `repetitive_content` | info | Output contains repetitive patterns |
@@ -325,17 +317,6 @@ Detects scans where content is shrunk to a tiny unreadable area.
 - Catches: faxed documents, thumbnail-quality scans, shrunken copies
 - Result: RED flag, `low_quality_scan` detail, zero text, no OCR performed
 
-## Tesseract Fallback
-
-When DeepSeek-OCR extracts no meaningful text (<=10 chars) from a non-blank page:
-
-1. Image preprocessed with adaptive thresholding (removes watermarks)
-2. Tesseract OCR runs on the preprocessed image
-3. If text extracted: returns with `ocr_engine: "tesseract"`, flag YELLOW
-4. If Tesseract also fails: returns with `needs_external_ocr: true`
-
-Disable with: `TESSERACT_FALLBACK=false`
-
 ## Feedback System
 
 Automatically saves low-scoring OCR results for future model fine-tuning.
@@ -343,7 +324,7 @@ Automatically saves low-scoring OCR results for future model fine-tuning.
 ### How It Works
 
 ```
-1. Page scores below 0.70 or uses Tesseract fallback
+1. Page scores below 0.70
    → Image + metadata saved to feedback/pending/
 
 2. Downstream AI or human sends corrected text
@@ -371,7 +352,6 @@ feedback/
 ### What Gets Saved
 
 - Pages scoring **below 0.70** (YELLOW/RED)
-- All **Tesseract fallback** results
 - GREEN pages are **not saved** (no disk wasted)
 - Estimated storage: ~210 KB per page (image + metadata)
 
@@ -406,7 +386,6 @@ Disable with: `FEEDBACK_ENABLED=false`
 | `REQUEST_TIMEOUT_S` | `120` | Request timeout (seconds) |
 | `SCORE_THRESHOLD` | `0.60` | Score below this triggers retry |
 | `MAX_RETRIES` | `3` | Max retry attempts |
-| `TESSERACT_FALLBACK` | `true` | Enable Tesseract fallback |
 | `FEEDBACK_DIR` | `/workspace/DeepSeek-OCR-1/feedback` | Feedback storage path |
 | `FEEDBACK_ENABLED` | `true` | Enable feedback storage |
 | `FEEDBACK_SCORE_THRESHOLD` | `0.70` | Save results below this score |
@@ -458,7 +437,6 @@ Tested on 54-page housing compliance document set:
 | RED (manual review) | 1.9% of pages |
 | Average composite score | 0.876 |
 | Blank/low-quality skip time | ~1ms (instant) |
-| Tesseract fallback success | 100% (1/1 pages) |
 | Total chars extracted | 131,610 |
 
 ## Model Details
