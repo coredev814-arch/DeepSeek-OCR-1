@@ -221,46 +221,62 @@ def _skip_page_result(reason: str, flag_detail: str) -> dict:
 
 
 def _save_feedback(image: Image.Image, result: dict, filename: str = None):
-    """Save low-scoring OCR results for future fine-tuning."""
+    """Save low-scoring OCR results for future fine-tuning.
+
+    Runs off the request path via asyncio.to_thread. All I/O failures
+    are swallowed and logged — feedback storage must never break OCR.
+    """
     if not FEEDBACK_ENABLED:
         return
 
     score = result.get("score", {}).get("composite", 1.0)
-    engine_used = result.get("ocr_engine", "deepseek")
-
     if score >= FEEDBACK_SCORE_THRESHOLD:
         return
 
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
-    entry_id = f"{timestamp}_{uuid.uuid4().hex[:12]}"
+    try:
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        entry_id = f"{timestamp}_{uuid.uuid4().hex[:12]}"
 
-    pending_dir = os.path.join(FEEDBACK_DIR, "pending")
-    os.makedirs(pending_dir, exist_ok=True)
+        pending_dir = os.path.join(FEEDBACK_DIR, "pending")
+        os.makedirs(pending_dir, exist_ok=True)
 
-    # Save image
-    img_path = os.path.join(pending_dir, f"{entry_id}.png")
-    image.save(img_path, format="PNG")
+        img_path = os.path.join(pending_dir, f"{entry_id}.png")
+        image.save(img_path, format="PNG")
 
-    # Save metadata
-    meta = {
-        "id": entry_id,
-        "timestamp": timestamp,
-        "filename": filename,
-        "ocr_engine": result.get("ocr_engine"),
-        "score": result.get("score", {}).get("composite"),
-        "flag": result.get("flag"),
-        "text": result.get("text", ""),
-        "raw_text": result.get("raw_text", ""),
-        "attempts": result.get("attempts", 0),
-        "corrected_text": None,  # filled by /feedback/correct
-        "status": "pending",
-    }
-    meta_path = os.path.join(pending_dir, f"{entry_id}.json")
-    import json as _json
-    with open(meta_path, "w") as f:
-        _json.dump(meta, f, indent=2)
+        meta = {
+            "id": entry_id,
+            "timestamp": timestamp,
+            "filename": filename,
+            "ocr_engine": result.get("ocr_engine"),
+            "score": result.get("score", {}).get("composite"),
+            "flag": result.get("flag"),
+            "text": result.get("text", ""),
+            "raw_text": result.get("raw_text", ""),
+            "attempts": result.get("attempts", 0),
+            "corrected_text": None,
+            "status": "pending",
+        }
+        meta_path = os.path.join(pending_dir, f"{entry_id}.json")
+        import json as _json
+        with open(meta_path, "w") as f:
+            _json.dump(meta, f, indent=2)
 
-    logger.info("Feedback saved: %s (score=%.3f, engine=%s)", entry_id, score, result.get("ocr_engine"))
+        logger.info("Feedback saved: %s (score=%.3f, engine=%s)",
+                    entry_id, score, result.get("ocr_engine"))
+    except OSError as e:
+        logger.warning("Feedback save failed (I/O error): %s", e)
+    except Exception as e:
+        logger.warning("Feedback save failed: %s", e)
+
+
+def _schedule_feedback(image: Image.Image, result: dict, filename: str = None):
+    """Fire-and-forget feedback save; runs in a worker thread."""
+    if not FEEDBACK_ENABLED:
+        return
+    score = result.get("score", {}).get("composite", 1.0)
+    if score >= FEEDBACK_SCORE_THRESHOLD:
+        return
+    asyncio.create_task(asyncio.to_thread(_save_feedback, image, result, filename))
 
 
 def _mark_needs_external_ocr(result: dict) -> None:
@@ -734,13 +750,13 @@ async def ocr_image(
         result = await _run_inference_with_retry(image, prompt)
         if raw:
             result["text"] = result["raw_text"]
-        _save_feedback(image, result, filename=file.filename)
+        _schedule_feedback(image, result, filename=file.filename)
         return JSONResponse(result)
     else:
         enhanced = enhance_scan(image).convert("RGB")
         output = await _run_inference(enhanced, prompt)
         result = await _format_result(output, raw, image=image)
-        _save_feedback(image, result, filename=file.filename)
+        _schedule_feedback(image, result, filename=file.filename)
         return JSONResponse(result)
 
 
@@ -784,13 +800,13 @@ async def ocr_image_base64(
         result = await _run_inference_with_retry(image, prompt)
         if raw:
             result["text"] = result["raw_text"]
-        _save_feedback(image, result)
+        _schedule_feedback(image, result)
         return JSONResponse(result)
     else:
         enhanced = enhance_scan(image).convert("RGB")
         output = await _run_inference(enhanced, prompt)
         result = await _format_result(output, raw, image=image)
-        _save_feedback(image, result)
+        _schedule_feedback(image, result)
         return JSONResponse(result)
 
 
