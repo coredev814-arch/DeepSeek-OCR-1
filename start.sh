@@ -30,4 +30,6 @@ echo "============================================"
 
 cd "$(dirname "$0")"
 
-python3 api_service.py
+# exec: replace bash with python so the supervisor's PID == python's PID.
+# Without this, killing the bash wrapper leaves the python child orphaned.
+exec python3 api_service.py
